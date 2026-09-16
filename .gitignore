@@ -154,3 +154,5 @@ configs/local/default.yaml
 .aim
 
 wandb
+checkpoints
+checkpoints_1
