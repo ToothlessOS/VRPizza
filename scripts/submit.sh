@@ -26,7 +26,7 @@ uv sync
 #------------------------
 # Run code
 #------------------------
- uv run notebooks/POMO_sl.py 
+ uv run notebooks/POMO_sl.py
 
 #------------------------
 # Usage

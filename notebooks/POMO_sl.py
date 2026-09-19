@@ -62,6 +62,11 @@ MAX_EPOCHS = 200
 # because the ~110-step decode loop dominates, so raise the batch before adding workers.
 DATALOADER_WORKERS = 8
 
+# Identifies this run in both wandb and the checkpoint directory, so the two can always be
+# matched up. It names the settings most likely to be varied; widen it if you start sweeping
+# something it does not mention, rather than letting two configurations share a directory.
+RUN_NAME = f"sl-vrp{NUM_LOC}-lr-{LR}-wd-{WEIGHT_DECAY}-B-{BATCH_SIZE}"
+
 
 def main() -> None:
     """Build the environment, model and trainer, then fit."""
@@ -95,9 +100,17 @@ def main() -> None:
     # Checkpoint on the multi-start, augmented reward so it stays comparable with POMO's
     # reported numbers; `val/reward_greedy` is the unaugmented rollout and is the better
     # signal for judging progress early on.
+    #
+    # Each run owns a directory named after itself, so configurations that differ in any of
+    # the hyperparameters above cannot overwrite each other's `last.ckpt` and best-epoch file.
+    # Re-running one identical configuration does overwrite, which is what a rerun usually
+    # means; add a suffix to RUN_NAME if both should be kept.
     checkpoint_callback = ModelCheckpoint(
-        dirpath=Path(project_root()) / "checkpoints",
+        dirpath=Path(project_root()) / "checkpoints" / RUN_NAME,
         filename="epoch_{epoch:03d}",
+        # Without this Lightning prepends the monitored metric to the name it builds from
+        # `{epoch}`, and the file lands as `epoch_epoch=000.ckpt`.
+        auto_insert_metric_name=False,
         save_top_k=1,
         save_last=True,
         monitor="val/reward",
@@ -109,7 +122,7 @@ def main() -> None:
 
     logger = WandbLogger(
         project="cvrp-train-pomo",
-        name=f"sl-vrp{NUM_LOC}-lr-{LR}-wd-{WEIGHT_DECAY}-B-{BATCH_SIZE}",
+        name=RUN_NAME,
     )
 
     trainer = RL4COTrainer(

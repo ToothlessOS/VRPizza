@@ -134,9 +134,11 @@ class CVRPSolutionDataset(Dataset):
         self.instance_range = (int(start), int(stop))
 
         # Local cumulative trajectory counts, so a pool index maps to an instance with a
-        # single searchsorted.
+        # single searchsorted. Each instance contributes `2R` trajectories -- each route can
+        # be served first from either end -- and the `divmod(slot, 2)` in `__getitem__`
+        # unpacks exactly that, so the running total is over `2R` and not `R`.
         self._csum = np.concatenate(
-            [[0], np.cumsum(self.num_routes[start:stop].astype(np.int64))]
+            [[0], 2 * np.cumsum(self.num_routes[start:stop].astype(np.int64))]
         )
         pool_size = int(self._csum[-1])
 

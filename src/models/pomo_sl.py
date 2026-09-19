@@ -24,10 +24,10 @@ from contextlib import contextmanager
 import torch
 
 import rl4co.models.common.constructive.base as _constructive
-from rl4co.data.transforms import StateAugmentation
 from rl4co.models.rl import RL4COLitModule
 from rl4co.models.zoo.am import AttentionModelPolicy
-from rl4co.utils.ops import unbatchify
+
+from src.models.components.pomo_inference import POMOInferenceMixin, validation_augmentation
 
 __all__ = ["POMOSL"]
 
@@ -74,7 +74,7 @@ def _capture_logprobs(sink: dict):
         _constructive.get_log_likelihood = _ORIGINAL_GET_LOG_LIKELIHOOD
 
 
-class POMOSL(RL4COLitModule):
+class POMOSL(POMOInferenceMixin, RL4COLitModule):
     """POMO with a supervised (teacher-forced) objective.
 
     Subclasses :class:`~rl4co.models.RL4COLitModule` rather than
@@ -83,6 +83,9 @@ class POMOSL(RL4COLitModule):
     variants, none of which apply to a supervised objective. The network is unchanged --
     the same :class:`~rl4co.models.zoo.am.AttentionModelPolicy` with POMO's
     hyperparameters -- so multi-start inference still works at validation and test time.
+
+    Validation is inherited from :class:`~src.models.components.pomo_inference.POMOInferenceMixin`,
+    which :class:`~src.models.POMORL` also uses so that the two can be compared.
 
     Args:
         env: The environment, normally :class:`~src.envs.CVRPEnv`.
@@ -120,11 +123,7 @@ class POMOSL(RL4COLitModule):
 
         self.num_augment = num_augment
         self.eval_greedy = eval_greedy
-        self.augment = (
-            StateAugmentation(num_augment=num_augment, augment_fn=augment_fn)
-            if num_augment > 1
-            else None
-        )
+        self.augment = validation_augmentation(num_augment, augment_fn)
 
         # log_metrics silently drops any key that is not declared here, so an
         # undeclared supervised loss would vanish from the logs without warning.
@@ -177,42 +176,6 @@ class POMOSL(RL4COLitModule):
 
         metrics = self.log_metrics(out, phase, dataloader_idx=dataloader_idx)
         return {"loss": out.get("loss", None), **metrics}
-
-    def _inference_step(self, batch, phase: str) -> dict:
-        """Evaluate with POMO's multi-start, dihedral-augmented rollout.
-
-        Args:
-            batch: A batch from the environment's dataset.
-            phase: ``"val"`` or ``"test"``, which selects the policy decode type.
-
-        Returns:
-            A dict of rewards under the keys the declared metrics expect.
-        """
-        td = self.env.reset(self.env.make_input_td(batch))
-        if self.augment is not None:
-            td = self.augment(td)
-
-        num_starts = self.env.get_num_starts(td)
-        out = self.policy(td, self.env, phase=phase, num_starts=num_starts)
-
-        # [B, num_augment, num_starts] -> best over both, matching POMO's inference.
-        reward = unbatchify(out["reward"], (self.num_augment, num_starts))
-        out["reward"] = reward.max(dim=-1).values.max(dim=-1).values
-
-        if self.eval_greedy:
-            # A second, fresh input: the first `td` was consumed by `reset` and then
-            # expanded by the augmentation.
-            td_greedy = self.env.reset(self.env.make_input_td(batch))
-            greedy = self.policy(td_greedy, self.env, phase=phase, decode_type="greedy")
-            out["reward_greedy"] = greedy["reward"]
-
-        # Gap against the file's reference objective, measured on the headline rollout so
-        # it moves together with the checkpoint metric. `reward_greedy` is the
-        # unaugmented single rollout and will read considerably worse, especially early.
-        reference = self.env.reference_cost(batch)
-        out["gap_ref"] = (-out["reward"] - reference) / reference
-        out["loss"] = None
-        return out
 
     def calculate_loss(
         self, _td, _batch, policy_out: dict, valid=None, logprobs=None, **_kwargs
