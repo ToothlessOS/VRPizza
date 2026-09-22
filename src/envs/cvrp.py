@@ -8,6 +8,11 @@ The whole integration point is :meth:`CVRPEnv.dataset`. ``RL4COLitModule.setup``
 ``env.dataset(size, phase=...)`` and wraps whatever comes back in a DataLoader, so
 overriding that one method is enough to drive supervised learning from these files
 without touching the Lightning module.
+
+Turning a batch into environment input is not specific to this class -- scoring a checkpoint
+needs the same conversion, from a batch no dataset produced. That half lives in
+:class:`InstanceInputMixin`, which :class:`~src.envs.EvalCVRPEnv` shares, so the demand
+normalisation is defined once and cannot drift between training and evaluation.
 """
 
 from __future__ import annotations
@@ -16,14 +21,13 @@ from collections.abc import Sequence
 
 import numpy as np
 import torch
-
 from rl4co.envs.routing.cvrp.env import CVRPEnv as _RL4COCVRPEnv
 from tensordict.tensordict import TensorDict
 
 from src.envs.dataset import CVRPSolutionDataset, build_index
 from src.envs.parser import resolve_data_path
 
-__all__ = ["CVRPEnv"]
+__all__ = ["CVRPEnv", "InstanceInputMixin"]
 
 
 def _resolve_size(batch_size: int | Sequence | None) -> int | None:
@@ -49,7 +53,63 @@ def _resolve_size(batch_size: int | Sequence | None) -> int | None:
     return int(batch_size[0])
 
 
-class CVRPEnv(_RL4COCVRPEnv):
+class InstanceInputMixin:
+    """Conversion between a batch of instances and rl4co environment input.
+
+    Mixed into every environment that scores or trains on pre-built batches, ahead of the
+    rl4co base class so the rl4co methods it does not override still resolve. rl4co's own
+    ``CVRPEnv`` defines neither method, so there is nothing shadowed.
+
+    The two methods are the whole of the contract with
+    :meth:`~src.models.components.pomo_inference.POMOInferenceMixin._inference_step`, which
+    calls them as ``self.env.make_input_td(batch)`` and ``self.env.reference_cost(batch)``
+    and therefore needs them on the environment rather than as free functions.
+    """
+
+    def make_input_td(self, batch: TensorDict) -> TensorDict:
+        """Build the environment input from a batch carrying raw instance fields.
+
+        Returns a fresh TensorDict on every call: ``CVRPEnv.reset`` mutates its input in
+        place, widening ``locs`` from ``[B, N, 2]`` to ``[B, N+1, 2]``, so a batch that
+        had already been reset cannot be reset again.
+
+        Args:
+            batch: A TensorDict with ``depot`` ``[B, 2]``, ``locs`` ``[B, N, 2]``, ``demand``
+                ``[B, N]`` and ``capacity`` ``[B]``, as produced by
+                :meth:`~src.envs.dataset.CVRPSolutionDataset.collate_fn` or by an evaluation
+                driver.
+
+        Returns:
+            A TensorDict with ``depot`` ``[B, 2]``, ``locs`` ``[B, N, 2]`` (depot excluded,
+            as rl4co expects) and ``demand`` ``[B, N]`` normalised by capacity.
+        """
+        return TensorDict(
+            {
+                "depot": batch["depot"],
+                "locs": batch["locs"],
+                "demand": batch["demand"] / batch["capacity"][:, None],
+            },
+            batch_size=batch.batch_size,
+            device=batch.device,
+        )
+
+    @staticmethod
+    def reference_cost(batch: TensorDict) -> torch.Tensor:
+        """Return the reference solution cost carried by a batch.
+
+        Args:
+            batch: A batch carrying a ``cost`` field.
+
+        Returns:
+            A ``[B]`` tensor of reference objectives, positive. Note the HGS training
+            files carry a reference that differs from the stored coordinates' true
+            Euclidean length by up to ~6e-5 relative, while the LKH test files match to
+            machine precision.
+        """
+        return batch["cost"].to(torch.float32)
+
+
+class CVRPEnv(InstanceInputMixin, _RL4COCVRPEnv):
     """A CVRP environment whose instances come from a reference-solution dataset.
 
     Each instance in the file yields ``2R`` supervised trajectories rather than one,
@@ -173,30 +233,6 @@ class CVRPEnv(_RL4COCVRPEnv):
 
     # -- supervised-learning helpers ----------------------------------------------
 
-    def make_input_td(self, batch: TensorDict) -> TensorDict:
-        """Build the environment input from a dataset batch.
-
-        Returns a fresh TensorDict on every call: ``CVRPEnv.reset`` mutates its input in
-        place, widening ``locs`` from ``[B, N, 2]`` to ``[B, N+1, 2]``, so a batch that
-        had already been reset cannot be reset again.
-
-        Args:
-            batch: A batch produced by :meth:`~src.envs.dataset.CVRPSolutionDataset.collate_fn`.
-
-        Returns:
-            A TensorDict with ``depot`` ``[B, 2]``, ``locs`` ``[B, N, 2]`` (depot excluded,
-            as rl4co expects) and ``demand`` ``[B, N]`` normalised by capacity.
-        """
-        return TensorDict(
-            {
-                "depot": batch["depot"],
-                "locs": batch["locs"],
-                "demand": batch["demand"] / batch["capacity"][:, None],
-            },
-            batch_size=batch.batch_size,
-            device=batch.device,
-        )
-
     def build_expert_actions(
         self, batch: TensorDict
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -214,21 +250,6 @@ class CVRPEnv(_RL4COCVRPEnv):
             ``N + R - 1`` of them, since the final depot return is implicit.
         """
         return batch["actions"], batch["num_routes"], batch["valid"]
-
-    @staticmethod
-    def reference_cost(batch: TensorDict) -> torch.Tensor:
-        """Return the reference solution cost carried by a batch.
-
-        Args:
-            batch: A batch produced by a dataset over a file with a ``cost`` column.
-
-        Returns:
-            A ``[B]`` tensor of reference objectives, positive. Note the HGS training
-            files carry a reference that differs from the stored coordinates' true
-            Euclidean length by up to ~6e-5 relative, while the LKH test files match to
-            machine precision.
-        """
-        return batch["cost"].to(torch.float32)
 
     def num_trajectories(self, phase: str = "train") -> int:
         """Return the number of supervised trajectories available for a phase.
