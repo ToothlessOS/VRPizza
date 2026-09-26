@@ -241,11 +241,40 @@ fails, so one training's failure cannot be masked by the other succeeding.
 It uses `.venv/bin/python` rather than `uv run`: two concurrent `uv run` invocations contend on
 the environment lock, and the `uv sync` above has already built everything they need.
 
-**Memory is the thing to watch.** The supervised run batches 1024 rows per step, ~4× what
-`POMO_sl.py` was tuned around. On an A40's 48 GiB that is comfortable, but a CUDA OOM here
-means lowering `INSTANCES_PER_BATCH` from 64 to 16 in *both* entry scripts — which keeps the
-supervised batch at its original 256 rows and shrinks only the RL one — and raising
-`MAX_EPOCHS` to compensate for the smaller per-epoch draw.
+**Host memory is the first thing that breaks, and it does not look like a memory problem.**
+rl4co forces the `spawn` start method (`torchrl` sets it globally on import, which is why both
+entry scripts guard their work behind `if __name__ == "__main__"`), so every DataLoader worker
+is a fresh interpreter that re-imports torch and rl4co before reading anything. Measured, that
+floor is **~790 MB per worker** — about 80× the 10 MB dataset it then holds:
+
+```
+8 workers x 790 MB x 2 trainings   ~= 12.6 GB
+2 main processes + CUDA host ctx   ~=  3-4  GB
+                                      --------
+                                      ~16-17 GB   vs  --mem-per-cpu=1G x -c 16 = 16 GB
+```
+
+That sits on the cgroup cliff, and the failure is badly mislabelled: a parent killed mid-spawn
+leaves its child reporting `_pickle.UnpicklingError: pickle data was truncated`, with dozens of
+leaked semaphores logged at shutdown. It reads like a pickling bug and is not one — both
+datasets pickle to 10.85 MB and round-trip cleanly, and *which* training dies is timing-
+dependent, so pinning it on the RL run is a red herring. Confirm with
+
+```bash
+sacct -j <JOBID> --format=JobID,State,ExitCode,MaxRSS,ReqMem,Elapsed
+```
+
+where `OUT_OF_MEMORY`, or a `MaxRSS` sitting at `ReqMem`, means this. Hence `--mem-per-cpu=4G`
+and `DATALOADER_WORKERS = 4` in the shipped scripts. The worker count is the cheaper lever
+(8→4 saves ~6.3 GB across the pair) and is free in data terms, since the draw is seeded from the
+dataset rather than the worker count. The many-worker cost is worth remembering generally: with
+`spawn`, worker count multiplies a ~790 MB import, not a 10 MB payload.
+
+**GPU memory** is the second thing. The supervised run batches 1024 rows per step, ~4× what
+`POMO_sl.py` was tuned around. On an A40's 48 GiB that is comfortable, but a CUDA OOM here means
+lowering `INSTANCES_PER_BATCH` from 64 to 16 in *both* entry scripts — which keeps the
+supervised batch at its original 256 rows and shrinks only the RL one — and raising `MAX_EPOCHS`
+to compensate for the smaller per-epoch draw.
 
 ## Verifying it
 

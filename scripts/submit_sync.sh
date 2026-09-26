@@ -6,8 +6,9 @@
 #------------------------
 # SLURM resource requests
 #------------------------
-#SBATCH -c 16                   # 8 DataLoader workers per training, plus the two main processes
-#SBATCH --mem-per-cpu=1G        # (1G) for each CPU core
+#SBATCH -c 16                   # 4 DataLoader workers per training, plus the two main processes
+#SBATCH --mem-per-cpu=4G        # -> 64 GB. 1G (16 GB total) is NOT enough for two trainings; see
+                                # the memory note below for the arithmetic.
 #SBATCH --job-name=POMO-SYNC
 #SBATCH --partition=common-gpu
 #SBATCH --gres=gpu:2            # one card per training; DKUCC allows max 4 per job
@@ -38,6 +39,12 @@ uv sync
 # `logs/`, which is git-ignored.
 mkdir -p logs/sync
 SYNC_LOG_DIR=logs/sync
+
+# Cap the per-process thread pools. Each of the 16 worker processes would otherwise start a full
+# OpenMP/MKL pool, and 18 processes x 8 threads is ~144 threads competing for 16 cores. This is a
+# throughput fix, not a correctness one.
+export OMP_NUM_THREADS=2
+export MKL_NUM_THREADS=2
 
 CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 \
     .venv/bin/python notebooks/POMO_sl_synced.py > "$SYNC_LOG_DIR/sl-synced.log" 2>&1 &
@@ -90,7 +97,31 @@ fi
 # Then:
 # uv add torch torchvision torchaudio
 #
-# NOTE ON MEMORY: the supervised run batches 1024 rows per step, roughly 4x what
+# NOTE ON HOST MEMORY (this is what bit us first):
+# rl4co forces the `spawn` multiprocessing start method, so every DataLoader worker is a fresh
+# interpreter that re-imports torch and rl4co before it touches any data. Measured, that floor
+# is ~790 MB per worker -- roughly 80x the 10 MB dataset it goes on to hold. With the original
+# DATALOADER_WORKERS=8 in each script, two concurrent trainings cost
+#
+#     8 workers x 790 MB x 2 trainings  ~= 12.6 GB
+#     two main processes + CUDA host     ~=  3-4 GB
+#                                          --------
+#                                          ~16-17 GB   against --mem-per-cpu=1G x -c 16 = 16 GB
+#
+# which is exactly on the cgroup cliff. The symptom is misleading: when the kernel kills a
+# parent mid-spawn, the child reports `_pickle.UnpicklingError: pickle data was truncated` and
+# the parent's shutdown logs dozens of leaked semaphores. That is a symptom of the kill, not a
+# pickling bug -- both datasets pickle to 10.85 MB and round-trip cleanly. Which training dies
+# is timing-dependent, so blaming the RL run is a red herring.
+#
+# Hence --mem-per-cpu=4G above. To confirm after a failure:
+#     sacct -j <JOBID> --format=JobID,State,ExitCode,MaxRSS,ReqMem,Elapsed
+# `OUT_OF_MEMORY`, or MaxRSS at ReqMem, means this. Lowering DATALOADER_WORKERS is the other
+# lever and the cheaper one -- 8->4 saves ~6.3 GB across the pair -- and it cannot change the
+# results, only the loading throughput, since the draw is seeded from the dataset rather than
+# the worker count. Keep the value equal in both scripts for symmetry.
+#
+# NOTE ON GPU MEMORY: the supervised run batches 1024 rows per step, roughly 4x what
 # notebooks/POMO_sl.py was tuned around (2.65 GiB at batch 128, measured on a 7.62 GiB card).
 # On an A40's 48 GiB that is comfortable, but it is the first thing to check if this job dies
 # with a CUDA OOM. The fallback is to lower INSTANCES_PER_BATCH from 64 to 16 in *both*

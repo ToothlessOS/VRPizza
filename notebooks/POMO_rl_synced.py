@@ -75,9 +75,17 @@ VAL_BATCH_SIZE = 256  # matches the supervised runs, so the epoch mean is weight
 VAL_DATA_SIZE = 10_000
 MAX_EPOCHS = 200
 
-# Both synced pipelines read the 4.6 GB file lazily, item by item, so workers pay for
-# themselves here as they do in the supervised script.
-DATALOADER_WORKERS = 8
+# Not 8, which is what the single-GPU supervised script uses. rl4co forces the `spawn` start
+# method, so each worker is a fresh interpreter that re-imports torch and rl4co -- measured at
+# ~790 MB before it holds any data, against a 10 MB dataset. Two concurrent trainings at 8
+# workers each come to ~12.6 GB of workers alone, which does not fit the 16 GB a `-c 16`
+# `--mem-per-cpu=1G` job gets, and the resulting kill surfaces as a truncated pickle in a
+# worker rather than as anything resembling an out-of-memory error. See scripts/submit_sync.sh.
+#
+# Kept equal to `POMO_sl_synced.py`'s value for symmetry, though unlike the draw constants
+# above it has no bearing on the data: the draw comes from the dataset's seed, not from the
+# worker count, so changing this moves throughput and nothing else.
+DATALOADER_WORKERS = 4
 
 # Bounds the log-likelihood sum from below in bf16; see POMO_og.py. The supervised side runs
 # bf16 for the same reason, so the two are also numerically alike.

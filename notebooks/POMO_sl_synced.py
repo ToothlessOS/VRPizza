@@ -77,7 +77,17 @@ VAL_BATCH_SIZE = 256  # matches the other runs, so the epoch mean is weighted id
 VAL_DATA_SIZE = 10_000
 MAX_EPOCHS = 200
 
-DATALOADER_WORKERS = 8
+# Not 8, which is what the single-GPU `POMO_sl.py` uses. rl4co forces the `spawn` start method,
+# so each worker is a fresh interpreter that re-imports torch and rl4co -- measured at ~790 MB
+# before it holds any data, against a 10 MB dataset. Two concurrent trainings at 8 workers each
+# come to ~12.6 GB of workers alone, which does not fit the 16 GB a `-c 16`
+# `--mem-per-cpu=1G` job gets; the kill then surfaces as a truncated pickle in a worker rather
+# than as anything resembling an out-of-memory error. See scripts/submit_sync.sh.
+#
+# Kept equal to `POMO_rl_synced.py`'s value for symmetry, though unlike the draw constants
+# above it has no bearing on the data: the draw comes from the dataset's seed, not from the
+# worker count, so changing this moves throughput and nothing else.
+DATALOADER_WORKERS = 4
 
 # Identifies this run in both wandb and the checkpoint directory. The `-synced` infix keeps
 # it apart from POMO_sl.py's `sl-` runs, and pairs it with `rl-synced-` for selection.
