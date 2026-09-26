@@ -3,6 +3,8 @@
 from src.envs.cvrp import CVRPEnv, InstanceInputMixin
 from src.envs.cvrp_eval import EvalCVRPEnv
 from src.envs.cvrp_rl import RLCVRPEnv
+from src.envs.cvrp_rl_synced import SyncedRLCVRPEnv
+from src.envs.cvrp_sl_synced import SyncedCVRPEnv
 from src.envs.dataset import CVRPSolutionDataset, build_index
 from src.envs.instances import InstanceSet, load_instances
 from src.envs.parser import (
@@ -12,19 +14,31 @@ from src.envs.parser import (
     resolve_data_path,
     scan_offsets,
 )
+from src.envs.synced_dataset import (
+    CVRPSyncedDataset,
+    CVRPSyncedSolutionDataset,
+    feasible_starts,
+    sample_epoch_slots,
+)
 
 __all__ = [
     "CVRPEnv",
+    "CVRPSyncedDataset",
+    "CVRPSyncedSolutionDataset",
     "EvalCVRPEnv",
     "InstanceInputMixin",
     "InstanceSet",
     "RLCVRPEnv",
     "CVRPSolutionDataset",
     "InstanceLayout",
+    "SyncedCVRPEnv",
+    "SyncedRLCVRPEnv",
     "build_index",
     "clean_token",
+    "feasible_starts",
     "load_instances",
     "project_root",
     "resolve_data_path",
+    "sample_epoch_slots",
     "scan_offsets",
 ]
