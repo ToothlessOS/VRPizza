@@ -4,9 +4,11 @@ from src.envs.cvrp import CVRPEnv, InstanceInputMixin
 from src.envs.cvrp_eval import EvalCVRPEnv
 from src.envs.cvrp_rl import RLCVRPEnv
 from src.envs.cvrp_rl_synced import SyncedRLCVRPEnv
+from src.envs.cvrp_sl_lehd import LEHDCVRPEnv, LEHDEvalCVRPEnv, PartialResetMixin
 from src.envs.cvrp_sl_synced import SyncedCVRPEnv
 from src.envs.dataset import CVRPSolutionDataset, build_index
 from src.envs.instances import InstanceSet, load_instances
+from src.envs.lehd_dataset import LEHDPartialDataset, collate_partials
 from src.envs.parser import (
     InstanceLayout,
     clean_token,
@@ -28,6 +30,10 @@ __all__ = [
     "EvalCVRPEnv",
     "InstanceInputMixin",
     "InstanceSet",
+    "LEHDCVRPEnv",
+    "LEHDEvalCVRPEnv",
+    "LEHDPartialDataset",
+    "PartialResetMixin",
     "RLCVRPEnv",
     "CVRPSolutionDataset",
     "InstanceLayout",
@@ -35,6 +41,7 @@ __all__ = [
     "SyncedRLCVRPEnv",
     "build_index",
     "clean_token",
+    "collate_partials",
     "feasible_starts",
     "load_instances",
     "project_root",

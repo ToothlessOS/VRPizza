@@ -18,9 +18,11 @@ Both are deliberate and explained under [Why this looks the way it does](#why-th
 
 **Checkpoints.** `discover_checkpoints` globs `checkpoints/*/last.ckpt` and takes the model class
 from the *directory name prefix*: `checkpoints/rl-vrp100-…/last.ckpt` is loaded as `POMORL`,
-`sl-…` as `POMOSL`. A directory whose prefix is not `rl` or `sl` is refused rather than guessed
-at, and `epoch_*.ckpt` files are never picked up — only `last.ckpt`. To evaluate something else,
-either add its prefix to `MODEL_CLASSES` or point `--checkpoints` at labels you have.
+`sl-…` as `POMOSL`, and `lehd-…` as `LEHDPOMOSL` (the LEHD objective shares POMO's architecture,
+so the weights are interchangeable). A directory whose prefix is not registered is refused
+rather than guessed at, and `epoch_*.ckpt` files are never picked up — only `last.ckpt`. The
+prefix is the text before the first `-`, so two `lehd-` directories collide; use a distinct
+prefix for an ablation run, or evaluate the main run only.
 
 Loading goes through `torch.load(…, weights_only=False)` and then `load_state_dict`, deliberately
 *not* `LightningModule.load_from_checkpoint`: the RL checkpoint pickles its training environment
@@ -50,6 +52,7 @@ eight instances the mean gap is 69.4% unscaled against 4.4% rescaled.
 | `--limit` | none | instances per dataset, taken from the front |
 | `--batch-size` | per-`N` table | overrides `BATCH_BY_N`; OOM retries halve it |
 | `--num-augment` | `8` | leave it; `dihedral8` requires exactly 8 |
+| `--num-starts` | `N` | POMO starts; `1` disables multistart (a single model-chosen start) |
 | `--device` | `cuda` if available | |
 | `--out` | `logs/eval_pomo/results.npz` | |
 | `--no-save` | off | print only |
@@ -57,6 +60,13 @@ eight instances the mean gap is 69.4% unscaled against 4.4% rescaled.
 
 `--limit 8` is the cheapest useful check: it still runs the full `8 x N` rollout, so it exercises
 every code path, and it takes seconds.
+
+`--num-starts` and `--num-augment` are inference-only, so one checkpoint supports the whole
+ablation: `(N,8)` is POMO's standard best-of-`8N`, `(N,1)` removes the dihedral transforms, and
+`(1,8)` removes multistart (rl4co disables its forced-start path below two starts, leaving one
+model-chosen start). The same two settings drive the matched baseline in
+`notebooks/eval_rrc.py`, which is where RRC is evaluated; the checkpoint's training weights do
+not change.
 
 ## Reading the output
 
@@ -243,12 +253,15 @@ been reset cannot be reset again.
 ## Related scripts
 
 ```bash
+.venv/bin/python notebooks/eval_rrc.py           # LEHD Random Re-Construct + matched baseline
 .venv/bin/python scripts/verify_mcts.py          # the MCTS correctness suite, ~40 checks
 .venv/bin/python scripts/verify_val_parity.py    # SL and RL validate identically
 .venv/bin/python scripts/verify_sl_data.py       # the supervised data pipeline
+.venv/bin/python scripts/verify_lehd_data.py     # LEHD partial-solution geometry and draw
+.venv/bin/python scripts/verify_rrc.py           # RRC and the POMO/LEHD model parity
 ```
 
-All three are plain harnesses that print PASS/FAIL and exit non-zero, because pytest is not
+All of these are plain harnesses that print PASS/FAIL and exit non-zero, because pytest is not
 installed in this virtualenv and the repository's convention is a script rather than a test
 dependency. `verify_mcts.py` needs no checkpoint — it builds a randomly initialised `POMOSL` at
 `N=10`, so it runs in seconds and exercises the real forward pass.

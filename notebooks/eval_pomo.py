@@ -76,7 +76,7 @@ from tensordict.tensordict import TensorDict
 
 from src.envs import EvalCVRPEnv, InstanceSet, load_instances, project_root
 from src.mcts import POMOMCTSConfig, SearchStatistics, solve_batch_with_pomo_mcts
-from src.models import POMORL, POMOSL
+from src.models import LEHDPOMOSL, POMORL, POMOSL
 
 # --------------------------------------------------------------------------------------
 # Configuration
@@ -95,7 +95,7 @@ MCTS_OUT = "logs/eval_pomo_cvrp/results.npz"
 #: This namespace is for *checkpoints* only. The search adds a method dimension, and mixing the
 #: two would make `discover_checkpoints` hunt for a directory called `rl_mcts`; see
 #: :func:`method_label`.
-MODEL_CLASSES = {"rl": POMORL, "sl": POMOSL}
+MODEL_CLASSES = {"rl": POMORL, "sl": POMOSL, "lehd": LEHDPOMOSL}
 
 #: Suffix a result label carries when the search produced it.
 MCTS_SUFFIX = "_mcts"
@@ -202,8 +202,8 @@ def discover_checkpoints() -> dict[str, Path]:
     """Find the ``last.ckpt`` of every training run under ``checkpoints/``.
 
     Returns:
-        A dict mapping the run's label -- the prefix of its directory name, ``rl`` or ``sl`` --
-        to the checkpoint path.
+        A dict mapping the run's label -- the prefix of its directory name, ``rl``, ``sl`` or
+        ``lehd`` -- to the checkpoint path.
 
     Raises:
         ValueError: If a run directory's prefix is not in :data:`MODEL_CLASSES`, since the
@@ -328,14 +328,19 @@ def build_batch(records: list[dict[str, np.ndarray]]) -> TensorDict:
 
 
 @torch.no_grad()
-def run_batch(model, batch: TensorDict, scale: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def run_batch(
+    model, batch: TensorDict, scale: np.ndarray, num_starts: int | None = None
+) -> tuple[np.ndarray, np.ndarray]:
     """Score one batch with the checkpoint's rollout.
 
     Args:
-        model: A fitted :class:`~src.models.POMORL` or :class:`~src.models.POMOSL`, already
-            pointed at an environment of the batch's size.
+        model: A fitted :class:`~src.models.POMORL`, :class:`~src.models.POMOSL` or
+            :class:`~src.models.LEHDPOMOSL`, already pointed at an environment of the batch's
+            size.
         batch: A batch from :func:`build_batch`, in model units.
         scale: ``[B]`` factors converting a length in model units back to the file's units.
+        num_starts: POMO start nodes, or ``None`` for the environment's ``N``. ``1`` is a
+            single rollout and is the "no multistart" arm of the inference ablation.
 
     Returns:
         ``(tour, gap)`` as float64 arrays of length ``B``. ``tour`` is in the file's units;
@@ -348,7 +353,7 @@ def run_batch(model, batch: TensorDict, scale: np.ndarray) -> tuple[np.ndarray, 
             failure a rescaled dataset invites, and one that otherwise yields a plausible but
             wrong number.
     """
-    out = model._inference_step(batch, "test")
+    out = model._inference_step(batch, "test", num_starts=num_starts)
 
     reward = out["reward"].double().cpu().numpy()  # negative tour length, model units
     gap = out["gap_ref"].double().cpu().numpy() * 100.0
@@ -493,6 +498,7 @@ def evaluate(
     batch_override: int | None,
     search_cfg: POMOMCTSConfig | None = None,
     search_batch: int | None = None,
+    num_starts: int | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[int, int], dict[str, SearchStatistics]]:
     """Score every model over every instance of one dataset.
 
@@ -517,6 +523,8 @@ def evaluate(
         search_cfg: Search configuration, or ``None`` for the plain POMO rollout.
         search_batch: Instances per searched batch, overriding :func:`mcts_batch_for`. Ignored
             when ``search_cfg`` is ``None``.
+        num_starts: POMO start nodes for the plain rollout, or ``None`` for ``N``. Ignored by
+            the searched path, whose baseline is seeded from the search.
 
     Returns:
         ``(tours, gaps, batch_sizes, stats)``. ``tours`` and ``gaps`` map label to ``[M]``
@@ -559,7 +567,7 @@ def evaluate(
                     # TensorDict it is handed, and the two rollouts must see identical inputs.
                     batch = build_batch(records).to(device)
                     if search_cfg is None:
-                        tour, gap = run_batch(model, batch, scale)
+                        tour, gap = run_batch(model, batch, scale, num_starts=num_starts)
                         tours[label][chunk] = tour
                         gaps[label][chunk] = gap
                         continue
@@ -844,6 +852,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--limit", type=int, default=None, help="instances per dataset")
     parser.add_argument("--batch-size", type=int, default=None, help="override the per-N batch")
     parser.add_argument("--num-augment", type=int, default=NUM_AUGMENT)
+    parser.add_argument(
+        "--num-starts",
+        type=int,
+        default=None,
+        help="POMO start nodes for the plain rollout (default: N; 1 disables multistart)",
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument(
         "--out", default=None, help="where to save the per-instance arrays "
@@ -895,7 +909,11 @@ def main(argv: list[str] | None = None) -> int:
     datasets = discover_datasets(args.datasets)
     print(f"checkpoints: {', '.join(f'{k} ({v.parent.name})' for k, v in checkpoints.items())}")
     print(f"datasets:    {', '.join(name for name, _ in datasets)}")
-    print(f"device:      {args.device}   augmentations: {args.num_augment}")
+    starts_label = "N" if args.num_starts is None else str(args.num_starts)
+    print(
+        f"device:      {args.device}   augmentations: {args.num_augment}   "
+        f"starts: {starts_label}"
+    )
 
     search_cfg = None
     if args.mcts:
@@ -977,7 +995,14 @@ def main(argv: list[str] | None = None) -> int:
 
         started = time.time()
         tours, gaps, batch_sizes, run_stats = evaluate(
-            inst, models, normalize, args.device, args.batch_size, search_cfg, args.mcts_batch
+            inst,
+            models,
+            normalize,
+            args.device,
+            args.batch_size,
+            search_cfg,
+            args.mcts_batch,
+            args.num_starts,
         )
         print(f"  done in {time.time() - started:.1f}s")
 

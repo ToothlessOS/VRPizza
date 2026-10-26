@@ -1,0 +1,1 @@
+Please look into the POMO metrics on the validation set during training - are the results based on greedy decode or decode with 8x dihedral augmentation?

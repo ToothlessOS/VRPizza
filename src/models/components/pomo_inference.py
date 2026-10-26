@@ -62,15 +62,23 @@ class POMOInferenceMixin:
     * ``eval_greedy`` -- whether to also report an unaugmented greedy rollout.
     """
 
-    def _inference_step(self, batch, phase: str) -> dict:
+    def _inference_step(self, batch, phase: str, num_starts: int | None = None) -> dict:
         """Evaluate with POMO's multi-start, dihedral-augmented rollout.
 
         Args:
             batch: A batch from the environment's dataset.
             phase: ``"val"`` or ``"test"``, which selects the policy decode type.
+            num_starts: Number of POMO start nodes. ``None`` keeps the historical behaviour,
+                ``env.get_num_starts(td) = N``. ``1`` is a single rollout whose start is
+                chosen by the model (rl4co disables its multistart path below 2), which is
+                useful as the "no multistart" arm of the inference ablation. RRC passes its
+                captured actions through the same setting, so the comparison is matched.
 
         Returns:
             A dict of rewards under the keys the declared metrics expect.
+
+        Raises:
+            ValueError: If ``num_starts`` is not a positive integer.
         """
         augment = self.augment
         if augment is not None and augment.num_augment != self.num_augment:
@@ -85,7 +93,12 @@ class POMOInferenceMixin:
         if augment is not None:
             td = augment(td)
 
-        num_starts = self.env.get_num_starts(td)
+        if num_starts is None:
+            num_starts = self.env.get_num_starts(td)
+        else:
+            num_starts = int(num_starts)
+            if num_starts <= 0:
+                raise ValueError(f"num_starts must be positive, got {num_starts}")
         out = self.policy(td, self.env, phase=phase, num_starts=num_starts)
 
         # [B, num_augment, num_starts] -> best over both, matching POMO's inference.
