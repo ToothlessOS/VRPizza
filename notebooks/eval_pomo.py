@@ -76,7 +76,7 @@ from tensordict.tensordict import TensorDict
 
 from src.envs import EvalCVRPEnv, InstanceSet, load_instances, project_root
 from src.mcts import POMOMCTSConfig, SearchStatistics, solve_batch_with_pomo_mcts
-from src.models import LEHDPOMOSL, POMORL, POMOSL
+from src.models import LEHDPOMORL, LEHDPOMOSL, POMORL, POMOSIL, POMOSL
 
 # --------------------------------------------------------------------------------------
 # Configuration
@@ -95,7 +95,18 @@ MCTS_OUT = "logs/eval_pomo_cvrp/results.npz"
 #: This namespace is for *checkpoints* only. The search adds a method dimension, and mixing the
 #: two would make `discover_checkpoints` hunt for a directory called `rl_mcts`; see
 #: :func:`method_label`.
-MODEL_CLASSES = {"rl": POMORL, "sl": POMOSL, "lehd": LEHDPOMOSL}
+MODEL_CLASSES = {
+    "rl": POMORL,
+    "sl": POMOSL,
+    "lehd": LEHDPOMOSL,
+    # LEHD-style RL, teacher-cost and shared baselines. The two run prefixes are distinct
+    # because `discover_checkpoints` keys on the text before the first "-".
+    "lehd_rl": LEHDPOMORL,
+    "lehd_rl_shared": LEHDPOMORL,
+    # Self-improvement learning: the same policy network, trained by an RL warm-up followed by
+    # teacher forcing on self-generated pseudo-experts.
+    "sil": POMOSIL,
+}
 
 #: Suffix a result label carries when the search produced it.
 MCTS_SUFFIX = "_mcts"

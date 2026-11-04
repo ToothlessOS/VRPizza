@@ -29,7 +29,7 @@ from rl4co.models.zoo.am import AttentionModelPolicy
 
 from src.models.components.pomo_inference import POMOInferenceMixin, validation_augmentation
 
-__all__ = ["POMOSL"]
+__all__ = ["POMOSL", "teacher_forced_train_step"]
 
 # Grabbed before anything can replace it, so the context manager below is re-entrant with
 # respect to repeated use and always restores the genuine function.
@@ -152,25 +152,7 @@ class POMOSL(POMOInferenceMixin, RL4COLitModule):
             A dict with ``loss`` plus whatever :meth:`log_metrics` accepted.
         """
         if phase == "train":
-            # Read the reference trajectories before resetting: `CVRPEnv.reset` mutates
-            # its input in place, so anything read off `batch` afterwards is widened.
-            actions, _, valid = self.env.build_expert_actions(batch)
-            td = self.env.reset(self.env.make_input_td(batch))
-            # `store_all_logp=True` makes the decoder retain the full action
-            # distribution; the capture hands it to `calculate_loss` for the accuracy.
-            captured: dict = {}
-            with _capture_logprobs(captured):
-                out = self.policy(
-                    td,
-                    self.env,
-                    phase="train",
-                    actions=actions,
-                    store_all_logp=True,
-                    return_sum_log_likelihood=False,
-                )
-            out = self.calculate_loss(
-                td, batch, out, valid=valid, logprobs=captured.get("logprobs")
-            )
+            out = teacher_forced_train_step(self, batch)
         else:
             out = self._inference_step(batch, phase)
 
@@ -204,7 +186,10 @@ class POMOSL(POMOInferenceMixin, RL4COLitModule):
         policy_out["ppl"] = ce_loss.detach().exp()
         policy_out["loss"] = ce_loss
         if logprobs is not None:
-            policy_out["accuracy"] = self._token_accuracy(
+            # Resolved on the class rather than `self`: `POMOSIL` routes this loss through the
+            # shared helper without inheriting `POMOSL`, so `self._token_accuracy` would not
+            # exist on it.
+            policy_out["accuracy"] = POMOSL._token_accuracy(
                 logprobs, policy_out["actions"], mask
             )
         return policy_out
@@ -255,3 +240,40 @@ class POMOSL(POMOInferenceMixin, RL4COLitModule):
         """
         td = self.env.reset(self.env.make_input_td(batch))
         return self.policy(td, self.env, phase="val", decode_type=decode_type)
+
+
+def teacher_forced_train_step(module, batch) -> dict:
+    """Run one teacher-forced cross-entropy step for a POMOSL-style module.
+
+    Shared by :class:`~src.models.POMOSL` and :class:`~src.models.POMOSIL`, so the supervised
+    objective and its metric plumbing are defined once. The caller supplies ``module`` rather
+    than inheriting this method because the SIL module's MRO resolves ``calculate_loss`` to
+    REINFORCE's policy-gradient loss in the warm-up phase; calling ``POMOSL.calculate_loss``
+    explicitly keeps the two objectives from shadowing each other.
+
+    Args:
+        module: A Lightning module with ``env``, ``policy`` and the POMOSL loss machinery.
+        batch: A batch carrying reference ``actions`` (``build_expert_actions`` reads them).
+
+    Returns:
+        The policy output dict updated by ``POMOSL.calculate_loss``.
+    """
+    # Read the reference trajectories before resetting: `CVRPEnv.reset` mutates its input in
+    # place, so anything read off `batch` afterwards is widened.
+    actions, _, valid = module.env.build_expert_actions(batch)
+    td = module.env.reset(module.env.make_input_td(batch))
+    # `store_all_logp=True` makes the decoder retain the full action distribution; the
+    # capture hands it to `calculate_loss` for the token-level accuracy.
+    captured: dict = {}
+    with _capture_logprobs(captured):
+        out = module.policy(
+            td,
+            module.env,
+            phase="train",
+            actions=actions,
+            store_all_logp=True,
+            return_sum_log_likelihood=False,
+        )
+    return POMOSL.calculate_loss(
+        module, td, batch, out, valid=valid, logprobs=captured.get("logprobs")
+    )
