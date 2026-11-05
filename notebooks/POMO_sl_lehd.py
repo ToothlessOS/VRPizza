@@ -38,7 +38,7 @@ from pathlib import Path
 import torch
 
 from lightning.pytorch.callbacks import ModelCheckpoint, RichModelSummary
-from lightning.pytorch.loggers import WandbLogger
+from swanlab.integration.pytorch_lightning import SwanLabLogger
 
 from rl4co.utils.trainer import RL4COTrainer
 
@@ -94,7 +94,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--smoke",
         action="store_true",
-        help="tiny run (few thousand partials, one epoch, no wandb) for pipeline checks",
+        help="tiny run (few thousand partials, one epoch, no SwanLab logging) for pipeline checks",
     )
     return parser.parse_args()
 
@@ -183,7 +183,9 @@ def main() -> None:
     # The smoke run deliberately writes no checkpoint: a `lehd-...-smoke` directory would be
     # discovered as the `lehd` label and could shadow the real run's `last.ckpt`.
 
-    logger = False if args.smoke else WandbLogger(project="cvrp-train-pomo", name=run_name)
+    logger = (
+        False if args.smoke else SwanLabLogger(project="cvrp-train-pomo", experiment_name=run_name)
+    )
 
     trainer = RL4COTrainer(
         max_epochs=max_epochs,

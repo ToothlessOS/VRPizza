@@ -25,7 +25,7 @@ rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 from pathlib import Path
 
 from lightning.pytorch.callbacks import ModelCheckpoint, RichModelSummary
-from lightning.pytorch.loggers import WandbLogger
+from swanlab.integration.pytorch_lightning import SwanLabLogger
 
 from rl4co.utils.trainer import RL4COTrainer
 
@@ -62,7 +62,7 @@ MAX_EPOCHS = 200
 # because the ~110-step decode loop dominates, so raise the batch before adding workers.
 DATALOADER_WORKERS = 8
 
-# Identifies this run in both wandb and the checkpoint directory, so the two can always be
+# Identifies this run in both SwanLab and the checkpoint directory, so the two can always be
 # matched up. It names the settings most likely to be varied; widen it if you start sweeping
 # something it does not mention, rather than letting two configurations share a directory.
 RUN_NAME = f"sl-vrp{NUM_LOC}-lr-{LR}-wd-{WEIGHT_DECAY}-B-{BATCH_SIZE}"
@@ -120,9 +120,9 @@ def main() -> None:
     rich_model_summary = RichModelSummary(max_depth=3)
     callbacks = [checkpoint_callback, rich_model_summary]
 
-    logger = WandbLogger(
+    logger = SwanLabLogger(
         project="cvrp-train-pomo",
-        name=RUN_NAME,
+        experiment_name=RUN_NAME,
     )
 
     trainer = RL4COTrainer(

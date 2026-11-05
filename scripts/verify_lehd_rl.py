@@ -19,7 +19,7 @@ The checks pin the claims in ``docs/LEHD_RL.md``:
 * the model has the same state dict and validation rewards as plain POMORL.
 
 The suite uses real records from the LKH test file and a one-layer policy on CPU, so it does
-not need a GPU, wandb or a trained checkpoint.
+not need a GPU, experiment tracking or a trained checkpoint.
 """
 
 from __future__ import annotations

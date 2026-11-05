@@ -38,7 +38,7 @@ rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 from pathlib import Path
 
 from lightning.pytorch.callbacks import ModelCheckpoint, RichModelSummary
-from lightning.pytorch.loggers import WandbLogger
+from swanlab.integration.pytorch_lightning import SwanLabLogger
 
 from rl4co.utils.trainer import RL4COTrainer
 
@@ -157,9 +157,9 @@ def main() -> None:
     rich_model_summary = RichModelSummary(max_depth=3)
     callbacks = [checkpoint_callback, rich_model_summary]
 
-    logger = WandbLogger(
+    logger = SwanLabLogger(
         project="cvrp-train-pomo",
-        name=RUN_NAME,
+        experiment_name=RUN_NAME,
     )
 
     trainer = RL4COTrainer(

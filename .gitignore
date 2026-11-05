@@ -154,5 +154,6 @@ configs/local/default.yaml
 .aim
 
 wandb
+swanlog
 checkpoints
 checkpoints_1

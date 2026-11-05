@@ -328,7 +328,7 @@ validation, checkpointing, and the best-state snapshot.
 ## Running it
 
 ```bash
-# Pipeline check (tiny, no wandb)
+# Pipeline check (tiny, no logging)
 .venv/bin/python notebooks/POMO_sil.py --search-type wor --smoke
 .venv/bin/python notebooks/POMO_sil.py --search-type beam_search --smoke
 

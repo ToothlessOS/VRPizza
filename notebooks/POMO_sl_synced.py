@@ -42,7 +42,7 @@ rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 from pathlib import Path
 
 from lightning.pytorch.callbacks import ModelCheckpoint, RichModelSummary
-from lightning.pytorch.loggers import WandbLogger
+from swanlab.integration.pytorch_lightning import SwanLabLogger
 
 from rl4co.utils.trainer import RL4COTrainer
 
@@ -89,7 +89,7 @@ MAX_EPOCHS = 200
 # worker count, so changing this moves throughput and nothing else.
 DATALOADER_WORKERS = 4
 
-# Identifies this run in both wandb and the checkpoint directory. The `-synced` infix keeps
+# Identifies this run in both SwanLab and the checkpoint directory. The `-synced` infix keeps
 # it apart from POMO_sl.py's `sl-` runs, and pairs it with `rl-synced-` for selection.
 RUN_NAME = (
     f"sl-synced-vrp{NUM_LOC}-lr-{LR}-wd-{WEIGHT_DECAY}"
@@ -158,9 +158,9 @@ def main() -> None:
     rich_model_summary = RichModelSummary(max_depth=3)
     callbacks = [checkpoint_callback, rich_model_summary]
 
-    logger = WandbLogger(
+    logger = SwanLabLogger(
         project="cvrp-train-pomo",
-        name=RUN_NAME,
+        experiment_name=RUN_NAME,
     )
 
     trainer = RL4COTrainer(

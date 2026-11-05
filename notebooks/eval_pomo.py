@@ -11,7 +11,7 @@ parameter, so a size it never saw is a legitimate test rather than an error.
 Scoring goes through :meth:`~src.models.components.pomo_inference.POMOInferenceMixin.
 _inference_step` -- the same multi-start, dihedral-augmented rollout that produced the
 ``val/reward`` and ``val/gap_ref`` the two runs were checkpointed on -- so these numbers mean
-the same thing as the curves in wandb. Where they differ, they differ because the data does:
+the same thing as the logged training curves. Where they differ, they differ because the data does:
 the logged values come from a held-out split of the HGS training file, these come from the
 LKH and VRPLIB test files.
 
@@ -112,7 +112,7 @@ MODEL_CLASSES = {
 MCTS_SUFFIX = "_mcts"
 
 #: Dihedral augmentations. ``dihedral8`` requires exactly 8, and both checkpoints were
-#: validated with this value, so changing it makes the numbers incomparable to wandb.
+#: validated with this value, so changing it makes the numbers incomparable to the logged values.
 NUM_AUGMENT = 8
 
 #: Datasets whose coordinates are not already in the model's training range. Keyed by a

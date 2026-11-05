@@ -5,7 +5,7 @@ instances sampled fresh from rl4co's CVRP generator every epoch. What is new is 
 Instead of being scored on another 10,000 generated instances, the model is now scored on the
 same fixed subset of ``data/CVRP`` that :mod:`notebooks.POMO_sl` validates on, and reports the
 same three metrics -- ``val/reward``, ``val/reward_greedy`` and ``val/gap_ref`` -- so the two
-training curves can be read against each other in wandb. Both come from
+training curves can be read against each other in SwanLab. Both come from
 :class:`~src.models.components.pomo_inference.POMOInferenceMixin`, so they cannot drift apart.
 
 Two knobs have to agree with ``POMO_sl.py`` for the subsets to be the same draw rather than
@@ -34,7 +34,7 @@ rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 from pathlib import Path
 
 from lightning.pytorch.callbacks import ModelCheckpoint, RichModelSummary
-from lightning.pytorch.loggers import WandbLogger
+from swanlab.integration.pytorch_lightning import SwanLabLogger
 
 from rl4co.utils.trainer import RL4COTrainer
 
@@ -66,9 +66,9 @@ MAX_EPOCHS = 200
 # POMO_sl.py runs bf16 for the same reason, so the two are also numerically alike here.
 PRECISION = "bf16-mixed"
 
-# Identifies this run in both wandb and the checkpoint directory, so the two can always be
+# Identifies this run in both SwanLab and the checkpoint directory, so the two can always be
 # matched up. The `rl-` prefix is what keeps it apart from POMO_sl.py's `sl-` runs: the two
-# scripts share a checkpoint root and a wandb project. It names the settings most likely to be
+# scripts share a checkpoint root and a SwanLab project. It names the settings most likely to be
 # varied; widen it if you start sweeping something it does not mention.
 RUN_NAME = f"rl-vrp{NUM_LOC}-lr-{LR}-wd-{WEIGHT_DECAY}-B-{BATCH_SIZE}"
 
@@ -124,9 +124,9 @@ def main() -> None:
 
     # Named to pair with POMO_sl.py's `sl-vrp100-...` runs in the same project, so the two
     # curves can be selected together; the same name is the checkpoint directory.
-    logger = WandbLogger(
+    logger = SwanLabLogger(
         project="cvrp-train-pomo",
-        name=RUN_NAME,
+        experiment_name=RUN_NAME,
     )
 
     trainer = RL4COTrainer(
