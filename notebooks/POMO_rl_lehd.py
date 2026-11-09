@@ -13,6 +13,13 @@ Run it with the project's virtualenv::
     .venv/bin/python notebooks/POMO_rl_lehd.py --baseline shared    # label-free, K=4
     .venv/bin/python notebooks/POMO_rl_lehd.py --smoke              # tiny pipeline check
     .venv/bin/python notebooks/POMO_rl_lehd.py --pilot              # 100k partials, 3 epochs
+    .venv/bin/python notebooks/POMO_rl_lehd.py --resume             # continue last.ckpt
+
+``--resume`` (or an explicit ``--ckpt-path``) continues a run through
+``trainer.fit(ckpt_path=...)``, restoring weights, optimizer, scheduler, epoch and the
+checkpoint callback's best score. ``--max-epochs`` overrides the total budget, so extending a
+finished run means passing a larger value. Pass the same CLI options as the original run so
+``run_name`` -- and therefore the checkpoint directory -- matches.
 
 Everything below is wrapped in ``main()`` behind a ``__name__`` guard because importing rl4co
 pulls in torchrl, which sets the global multiprocessing start method to ``spawn``; under spawn
@@ -36,6 +43,7 @@ from pathlib import Path
 
 import torch
 
+from lightning.pytorch import Trainer
 from lightning.pytorch.callbacks import ModelCheckpoint, RichModelSummary
 from swanlab.integration.pytorch_lightning import SwanLabLogger
 
@@ -109,6 +117,23 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="short run (100k partials, three epochs, no SwanLab/checkpoint) to watch the signal",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume from <checkpoints>/<run_name>/last.ckpt; pass the same CLI options as "
+        "the original run so run_name (and the checkpoint directory) match",
+    )
+    parser.add_argument(
+        "--ckpt-path",
+        default=None,
+        help="explicit checkpoint to resume from; overrides --resume",
+    )
+    parser.add_argument(
+        "--max-epochs",
+        type=int,
+        default=None,
+        help="override MAX_EPOCHS (total budget, not additional epochs)",
+    )
     return parser.parse_args()
 
 
@@ -154,6 +179,30 @@ def main() -> None:
         num_augment = 1
         run_name = f"{run_name}-pilot"
 
+    if args.max_epochs is not None:
+        max_epochs = args.max_epochs
+
+    if args.resume and args.ckpt_path is not None:
+        raise ValueError("pass either --resume or --ckpt-path, not both")
+
+    # All resumed state (weights, optimizer, scheduler, epoch, callback best score) comes from
+    # the `ckpt_path` handed to `trainer.fit`. `last.ckpt` is the epoch-end save, so it
+    # continues after the last completed epoch; the best checkpoint would repeat every epoch
+    # after the best one.
+    checkpoint_dir = Path(project_root()) / "checkpoints" / run_name
+    resume_path = args.ckpt_path
+    if resume_path is None and args.resume:
+        if args.smoke or args.pilot:
+            raise ValueError(
+                "--smoke/--pilot runs write no checkpoints; pass --ckpt-path explicitly if "
+                "you mean to resume from one"
+            )
+        resume_path = str(checkpoint_dir / "last.ckpt")
+    if resume_path is not None:
+        resume_path = str(Path(resume_path).expanduser())
+        if not Path(resume_path).is_file():
+            raise FileNotFoundError(f"no checkpoint at {resume_path}")
+
     if baseline == "shared" and num_samples < 2:
         raise ValueError(
             "--baseline shared needs --num-samples >= 2; with one sample the shared "
@@ -173,6 +222,15 @@ def main() -> None:
         val_instances=val_data_size // 10,
         effective_batch_size=EFFECTIVE_BATCH_SIZE,
     )
+
+    if resume_path is not None:
+        # `setup()` rebuilds the first epoch's partial dataset before Lightning restores
+        # `current_epoch`, and LEHDCVRPEnv keys that draw on this counter, which is not in the
+        # checkpoint either. Re-anchor it so the resumed run continues the `seed + epoch`
+        # sequence instead of replaying the permutations of epochs 0..N.
+        checkpoint = torch.load(resume_path, map_location="cpu", weights_only=False)
+        env._epoch = int(checkpoint["epoch"]) + 1
+        del checkpoint  # Lightning loads the file again; don't hold two copies
 
     model = LEHDPOMORL(
         env,
@@ -216,7 +274,7 @@ def main() -> None:
     quiet = args.smoke or args.pilot
     if not quiet:
         checkpoint_callback = ModelCheckpoint(
-            dirpath=Path(project_root()) / "checkpoints" / run_name,
+            dirpath=checkpoint_dir,
             filename="epoch_{epoch:03d}",
             auto_insert_metric_name=False,
             save_top_k=1,
@@ -245,7 +303,16 @@ def main() -> None:
         gradient_clip_val=GRADIENT_CLIP_VAL,
         enable_checkpointing=not quiet,
     )
-    trainer.fit(model)
+    if resume_path is None:
+        trainer.fit(model)
+    else:
+        # `RL4COTrainer.fit` predates Lightning's `weights_only` argument and does not forward
+        # it. Its only addition is clearing the gradient clip for manual-optimization models,
+        # which does not apply here, so call the base implementation for the resume.
+        # `weights_only=False`: our own checkpoints embed the training env in
+        # `hyper_parameters`, which torch 2.6's restricted unpickler refuses (same trust
+        # boundary as `--warmup-checkpoint` in the SIL driver).
+        Trainer.fit(trainer, model, ckpt_path=resume_path, weights_only=False)
 
 
 if __name__ == "__main__":

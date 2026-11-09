@@ -29,10 +29,17 @@ Run it with the project's virtualenv::
     .venv/bin/python notebooks/POMO_sil.py --search-type wor
     .venv/bin/python notebooks/POMO_sil.py --search-type beam_search
     .venv/bin/python notebooks/POMO_sil.py --search-type wor --smoke
+    .venv/bin/python notebooks/POMO_sil.py --search-type wor --resume   # continue last.ckpt
 
 ``--warmup-checkpoint PATH`` loads a completed run's ``state_dict`` and starts directly in
 SIL (``WARMUP_EPOCHS`` is then treated as 0). Use it to give both sampling arms identical
 warm-up weights instead of two independent RL warm-ups.
+
+``--resume`` (or an explicit ``--ckpt-path``) is the different operation of continuing the
+*same* run: ``trainer.fit(ckpt_path=...)`` restores weights, optimizer and epoch, and
+``on_load_checkpoint`` restores the best-so-far snapshot while forcing a fresh generation
+round. Do not use ``--warmup-checkpoint`` for that -- it copies weights only. ``--max-epochs``
+overrides the total budget, so extending a finished run means passing a larger value.
 
 Everything below is wrapped in ``main()`` behind a ``__name__`` guard because importing rl4co
 sets the global multiprocessing start method to ``spawn``; under spawn each DataLoader worker
@@ -49,6 +56,7 @@ from pathlib import Path
 
 import torch
 
+from lightning.pytorch import Trainer
 from lightning.pytorch.callbacks import ModelCheckpoint, RichModelSummary
 from swanlab.integration.pytorch_lightning import SwanLabLogger
 
@@ -137,12 +145,37 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="appended to the run name and checkpoint directory, e.g. to separate ablations",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume from <checkpoints>/<run_name>/last.ckpt; pass the same CLI options as "
+        "the original run so run_name (and the checkpoint directory) match",
+    )
+    parser.add_argument(
+        "--ckpt-path",
+        default=None,
+        help="explicit checkpoint to resume from; overrides --resume",
+    )
+    parser.add_argument(
+        "--max-epochs",
+        type=int,
+        default=None,
+        help="override MAX_EPOCHS (total budget, not additional epochs)",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     """Build the environment, model and trainer, then fit."""
     args = parse_args()
+
+    if args.resume and args.ckpt_path is not None:
+        raise ValueError("pass either --resume or --ckpt-path, not both")
+    if (args.resume or args.ckpt_path is not None) and args.warmup_checkpoint is not None:
+        raise ValueError(
+            "--warmup-checkpoint warm-starts from weights only; --resume/--ckpt-path continue "
+            "the full training state. Pass only one"
+        )
 
     search_type = args.search_type
     max_epochs = MAX_EPOCHS
@@ -183,6 +216,9 @@ def main() -> None:
         precision = "32-true"
         run_name = f"{run_name}-smoke"
 
+    if args.max_epochs is not None:
+        max_epochs = args.max_epochs
+
     # The beam arm gets the same candidate budget (width x rounds) in a single deterministic
     # pass, so the two arms differ only in how they sample.
     beam_width = base_beam_width
@@ -198,6 +234,18 @@ def main() -> None:
     if args.run_suffix:
         run_name = f"{run_name}-{args.run_suffix}"
 
+    # All resumed state (weights, optimizer, epoch, callback best score and the SIL best-so-far
+    # snapshot) comes from the `ckpt_path` handed to `trainer.fit`. `last.ckpt` is the
+    # epoch-end save, so it continues after the last completed epoch.
+    checkpoint_dir = Path(project_root()) / "checkpoints" / run_name
+    resume_path = args.ckpt_path
+    if resume_path is None and args.resume:
+        resume_path = str(checkpoint_dir / "last.ckpt")
+    if resume_path is not None:
+        resume_path = str(Path(resume_path).expanduser())
+        if not Path(resume_path).is_file():
+            raise FileNotFoundError(f"no checkpoint at {resume_path}")
+
     env = SILCVRPEnv(
         data_path=DATA_PATH,
         val_data_path=VAL_DATA_PATH,
@@ -207,6 +255,15 @@ def main() -> None:
         # validation instances and mirrors the other training scripts.
         val_instances=val_data_size // 10,
     )
+
+    if resume_path is not None:
+        # `setup()` rebuilds the first epoch's warm-up dataset before Lightning restores
+        # `current_epoch`, and the env keys that draw on this counter, which is not in the
+        # checkpoint either. Re-anchor it so a warm-up resume continues the `seed + epoch`
+        # sequence. SIL generation is keyed on `current_epoch` and is unaffected.
+        checkpoint = torch.load(resume_path, map_location="cpu", weights_only=False)
+        env._epoch = int(checkpoint["epoch"]) + 1
+        del checkpoint  # Lightning loads the file again; don't hold two copies
 
     model = POMOSIL(
         env,
@@ -256,7 +313,7 @@ def main() -> None:
     )
 
     checkpoint_callback = ModelCheckpoint(
-        dirpath=Path(project_root()) / "checkpoints" / run_name,
+        dirpath=checkpoint_dir,
         filename="epoch_{epoch:03d}",
         auto_insert_metric_name=False,
         save_top_k=1,
@@ -267,7 +324,9 @@ def main() -> None:
     callbacks = [checkpoint_callback, RichModelSummary(max_depth=3)]
 
     logger = (
-        False if args.smoke else SwanLabLogger(project="cvrp-train-pomo", experiment_name=run_name)
+        False
+        if args.smoke
+        else SwanLabLogger(project="cvrp-train-pomo", experiment_name=run_name)
     )
 
     trainer = RL4COTrainer(
@@ -279,7 +338,16 @@ def main() -> None:
         precision=precision,
     )
 
-    trainer.fit(model)
+    if resume_path is None:
+        trainer.fit(model)
+    else:
+        # `RL4COTrainer.fit` predates Lightning's `weights_only` argument and does not forward
+        # it. Its only addition is clearing the gradient clip for manual-optimization models,
+        # which does not apply here, so call the base implementation for the resume.
+        # `weights_only=False`: our own checkpoints embed the training env in
+        # `hyper_parameters`, which torch 2.6's restricted unpickler refuses (same trust
+        # boundary as `--warmup-checkpoint` above).
+        Trainer.fit(trainer, model, ckpt_path=resume_path, weights_only=False)
     print(
         f"best {GENERATION_SELECTION_METRIC}: {model._best_metric}; "
         f"generation snapshot: {'yes' if model._best_policy_state else 'no'}"
