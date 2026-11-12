@@ -96,16 +96,19 @@ VAL_DATA_SIZE = 10_000
 # Sampler. WOR uses `BEAM_WIDTH` per round for `NUM_ROUNDS` rounds; plain beam uses the same
 # total budget in a single round, so the arms differ only in how they sample.
 #
-# Generation cost measured on the workstation GPU (32 instances, N=100, chunk 32):
-# WOR k=32 x 4 -> ~57 s, beam k=128 x 1 -> ~23 s, i.e. roughly 30 min / 12 min per 1000
-# instances per SIL epoch. `NUM_INSTANCES_TO_GENERATE`, `BEAM_WIDTH` and `NUM_ROUNDS` are the
-# first things to lower if the SIL phase is too slow; generation, not the CE training, is the
-# bottleneck (~100 training steps take well under a minute).
+# Generation cost measured on the development GPU (RTX 4060, 32 instances, N=100, chunk 32):
+# WOR k=32 x 4 -> ~11 s, beam k=128 x 1 -> ~4 s, i.e. roughly 6 min / 2 min per 1000 instances
+# per SIL epoch (down from ~37 s / ~12 s before the search rework). Generation is still the
+# larger share of an epoch -- ~100 CE steps take well under a minute -- but the elapsed budget
+# is now dominated by the instance count, not by per-node Python overhead.
+# `NUM_INSTANCES_TO_GENERATE`, `BEAM_WIDTH` and `NUM_ROUNDS` remain the budget knobs. Measure a
+# new machine with `scripts/benchmark_sil_generation.py`; chunk sizes above 32 measured no
+# faster and only grow the WOR trie.
 SEARCH_TYPE = "wor"
 BEAM_WIDTH = 32
 NUM_ROUNDS = 4
 NUM_INSTANCES_TO_GENERATE = 1_000
-SEARCH_CHUNK_SIZE = 32  # decoder rows per chunk are at most chunk_size * beam_width
+SEARCH_CHUNK_SIZE = 32  # instances per encoded chunk; the cache is broadcast across the beam
 SEARCH_SEED = 0
 
 # Gumbeldore's SIL loop: generate with the best model so far, and keep appending generated

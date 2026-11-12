@@ -56,8 +56,12 @@ search expects. A `SILState` is one partial solution:
 | `used` | normalised load of the current vehicle |
 | `mask` | `[N+1]` bool, `True` = feasible (rl4co's convention) |
 | `done` | whether the episode has terminated |
-| `actions` | actions from the root through this state |
+| `actions` | actions from the root through this state (rebuilt on access from a linked path) |
 | `cost` | cumulative Euclidean length |
+
+`visited` and `mask` are **views** into the transition's shared `[n, N+1]` block rather than
+per-state copies, and `actions` is a linked list walked only when the final best leaf is
+converted to a record. A generation round allocates on the order of 10^7 states, so both matter.
 
 Two properties make the adapter cheap. First, the encoder depends only on the instance and the
 decoder is stateless with respect to decode progress, so one `PrecomputedCache` per chunk serves
@@ -66,13 +70,17 @@ CVRP action space is a fixed `[N+1]` axis at every depth (`0` = depot), unlike G
 `2N` `(customer, via_depot)` space, so states at different depths share one action ordering and
 no re-indexing is needed.
 
-States live on the CPU as NumPy arrays. `SILSearchAdapter.child_log_probability_fn` builds one
-minimal decoder TensorDict (`current_node`, `used_capacity`, `vehicle_capacity`,
-`action_mask`), index-selects the cache rows for the batch, and calls
-`policy.decoder(td, cached, num_starts=1)` followed by rl4co's `process_logits`, so SIL samples
-from exactly the distribution POMO decodes with. `child_transition_fn` steps the environment once
-for the whole level, then bulk-extracts the child fields with one `.cpu().numpy()` per field --
-per-row `.item()` would synchronise thousands of times per level.
+States live on the CPU as NumPy arrays. `SILSearchAdapter.child_log_probability_fn` groups the
+level's states by instance into a `[B, K]` block (padded to at least `K=2` with duplicated real
+rows), builds one minimal decoder TensorDict (`current_node`, `used_capacity`,
+`vehicle_capacity`, `action_mask`), and calls `policy.decoder(td, cached, num_starts=1)` with the
+**unexpanded per-instance cache**: it broadcasts over the `K` beam rows instead of materialising
+`K` cache rows per instance. That copy was the single largest cost of the original search
+(~200 KiB per row). When only a subset of the chunk is searched -- WOR round 2 onwards -- the
+cache rows are selected to match those instances. `process_logits` is unchanged, so SIL samples
+from exactly the distribution POMO decodes with. `child_transition_fn` is called once per level
+for all instances' selected expansions, then bulk-extracts the child fields with one
+`.cpu().numpy()` per field -- per-row `.item()` would synchronise thousands of times per level.
 
 ### Cost, and the implicit return edge
 
@@ -147,9 +155,10 @@ so an edit to one arm's budget is reflected in the other.
 `src/sil/search.py:generate_best_solutions` generates `NUM_INSTANCES_TO_GENERATE` fresh
 instances with `env.generator` (the same `CVRPGenerator(num_loc=100, capacity=50)` the RL runs
 use), splits them into `SEARCH_CHUNK_SIZE` chunks, encodes each chunk once, and runs the chosen
-sampler. Chunk size bounds the decoder batch: from round two onward, up to
-`chunk_size * beam_width` rows are materialised by the cache `index_select`, roughly 200 KB per
-row at `N=100`, `dim=128`. Keep it at 16-32.
+sampler. Chunk size no longer multiplies the decoder's cache footprint (the cache broadcasts
+across the beam); it bounds the WOR trie's memory, roughly `chunk_size * beam_width * depth`
+nodes at ~4 KB each. 32 is the practical value -- chunks of 64 and 128 measured no faster and
+only raised peak RSS.
 
 Each instance contributes exactly one record: its cheapest complete trajectory, converted back
 to the tagged-file representation with `src/lehd/subpath.actions_to_routes` and
@@ -270,13 +279,22 @@ registers the `sil` prefix in `MODEL_CLASSES`.
 | precision | bf16-mixed |
 | validation | 10,000 trajectories from the held-out HGS tail |
 
-Measured generation cost on the workstation GPU (N=100, chunk 32): WOR 32 instances in ~57 s and
-beam-128 in ~23 s, i.e. roughly 30 min and 12 min per 1,000 instances per SIL epoch. Generation,
-not CE training (~100 steps take well under a minute), is the bottleneck. Lower
-`NUM_INSTANCES_TO_GENERATE`, `BEAM_WIDTH` or `NUM_ROUNDS` first. At those rates the full
-150-epoch SIL phase is on the order of 75 h for WOR and 30 h for beam-128, so either the
-instance count or the epoch budget has to be sized against the job limit; 500 instances per
-epoch halves the generation cost and roughly halves the pseudo-expert pool.
+Measured generation cost on the development GPU (RTX 4060, N=100, chunk 32): WOR 32 instances in
+~11 s and beam-128 in ~4 s, i.e. roughly 6 min and 2 min per 1,000 instances per SIL epoch. That
+is ~3.5x faster than the pre-rework search (~37 s / ~12 s for the same shapes), which was
+CPU-bound: the GPU sat at 0-18% SM utilization while the decoder re-materialised ~200 KiB of
+cache per beam row and the merge/transition loops ran per node in Python. The search now groups
+the level into one `[B, K]` decoder batch with a broadcast per-instance cache, vectorises the
+candidate/Gumbel assembly, and issues one transition call per level; the remaining cost is the
+per-state object churn.
+
+Generation still outweighs CE training (~100 steps take well under a minute), so
+`NUM_INSTANCES_TO_GENERATE`, `BEAM_WIDTH` and `NUM_ROUNDS` remain the budget knobs. At those rates
+the full 150-epoch SIL phase is roughly 15 h for WOR and 5 h for beam-128. Measure a different
+machine with `scripts/benchmark_sil_generation.py`, which reports seconds/instance, decoder and
+env-step call counts, and sampled GPU utilization. Note that the decoder's batched GEMM changes
+fp accumulation by ~1e-6, so a fixed seed can select a slightly different beam path than the
+pre-rework search; batched transitions and the flat Gumbel draw are bit-exact.
 
 ## Faithfulness and deliberate deviations
 
@@ -317,10 +335,20 @@ supervised checkpoint (`--warmup-checkpoint`) removes the effect.
 3. WOR returns unique paths, no overlap between calls, and retains residual masses.
 4. The dormant `gumbeldore`/`theory_gumbeldore` updates return leaves and perturb edges; the
    importance-weighted expectation stays in range.
-5. Adapter log-probabilities sum to one over feasible actions and are `-inf` elsewhere.
-6. Every leaf cost equals `-env.get_reward`, including the implicit return edge.
-7. Both samplers produce feasible records covering all customers; every `2R` dataset item replays
-   to the record cost.
+5. Adapter log-probabilities sum to one over feasible actions and are `-inf` elsewhere; actions
+   accumulate across steps.
+6. The grouped `[B, K]` decoder matches the per-row cache path on finite log-probabilities
+   (`atol=1e-5`), including `K=1` padding and a subset of instances (the WOR round-2 shape).
+7. The flat Gumbel draw equals sequential per-node draws, consumes the same RNG stream, and keeps
+   each node's own maximum.
+8. One batched transition equals the per-instance transitions field for field.
+9. The O(1) trie exhaustion counter matches the residual-mass scan on every visited node.
+10. Every leaf cost equals `-env.get_reward`, including the implicit return edge.
+11. Generation is reproducible for a fixed seed, and both samplers produce feasible records
+    covering all customers; every `2R` dataset item replays to the record cost.
+
+`scripts/benchmark_sil_generation.py` reports generation throughput and GPU utilization for a
+given search arm and chunk size; use it to size a new machine.
 
 `notebooks/POMO_sil.py --smoke` then exercises the two-phase trainer: warm-up, generation, CE,
 validation, checkpointing, and the best-state snapshot.

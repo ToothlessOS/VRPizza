@@ -20,9 +20,37 @@ Both are deliberate and explained under [Why this looks the way it does](#why-th
 from the *directory name prefix*: `checkpoints/rl-vrp100-…/last.ckpt` is loaded as `POMORL`,
 `sl-…` as `POMOSL`, and `lehd-…` as `LEHDPOMOSL` (the LEHD objective shares POMO's architecture,
 so the weights are interchangeable). A directory whose prefix is not registered is refused
-rather than guessed at, and `epoch_*.ckpt` files are never picked up — only `last.ckpt`. The
-prefix is the text before the first `-`, so two `lehd-` directories collide; use a distinct
-prefix for an ablation run, or evaluate the main run only.
+rather than guessed at, and `epoch_*.ckpt` files are never picked up — only `last.ckpt`.
+
+`--checkpoint-dir` points the scan somewhere else (repeatable, and it replaces the default
+rather than adding to it). It takes a directory of runs, a single run directory, or a `.ckpt`
+file directly:
+
+```bash
+.venv/bin/python notebooks/eval_pomo.py --checkpoint-dir checkpoints_rl_sil_100
+```
+
+The prefix is the text before the first `-`, and it names the *model class*, not the run. Two
+runs of one family therefore collide — for instance the SIL runs are all `sil-…` — and the
+scan refuses outright rather than silently evaluating one and reporting it under the other's
+name. Name such runs individually with `--checkpoint LABEL=PATH` (repeatable; a bare `PATH`
+still takes its label from the directory prefix). The label must start with a registered
+prefix, because that is what selects the Lightning module; the rest of it is yours to choose:
+
+```bash
+.venv/bin/python notebooks/eval_pomo.py \
+    --checkpoint sil_w50=checkpoints_rl_sil_100/sil-wor-vrp100-lr-0.0001-wd-1e-06-k32x4-n1000-S256x100-w50/last.ckpt \
+    --checkpoint lehd_rl=checkpoints_rl_sil_100/lehd_rl_shared-vrp100-lr-0.0001-wd-1e-06-B-1024-shared-K-4-w-4-100/epoch_094.ckpt \
+    --checkpoint lehd_rl_shared=checkpoints_rl_sil_100/lehd_rl-vrp100-lr-0.0001-wd-1e-06-B-1024-teacher-K-1-w-4-100/epoch_094.ckpt
+```
+
+`--checkpoint` and `--checkpoint-dir` are alternatives, not additive: a scan and a named run
+could otherwise both claim the same label, and there is no non-arbitrary winner. Explicit
+labels are resolved to a class by longest registered prefix, so `lehd_rl_shared` stays the
+shared-baseline arm rather than matching `lehd_rl`.
+
+`notebooks/eval_rrc.py` accepts the same two flags with the same meanings, through the shared
+`select_checkpoints`, so the examples above work verbatim with that driver's name.
 
 Loading goes through `torch.load(…, weights_only=False)` and then `load_state_dict`, deliberately
 *not* `LightningModule.load_from_checkpoint`: the RL checkpoint pickles its training environment
@@ -48,7 +76,9 @@ eight instances the mean gap is 69.4% unscaled against 4.4% rescaled.
 | flag | default | notes |
 | --- | --- | --- |
 | `--datasets` | all five | file stems, without `.txt` |
-| `--checkpoints` | every one found | labels, i.e. directory prefixes |
+| `--checkpoints` | every one found | labels to keep from those selected, e.g. `rl sl` |
+| `--checkpoint-dir` | `checkpoints/` | where to scan; repeatable, replaces the default |
+| `--checkpoint` | none | `LABEL=PATH`; repeatable, replaces the scan and allows custom labels |
 | `--limit` | none | instances per dataset, taken from the front |
 | `--batch-size` | per-`N` table | overrides `BATCH_BY_N`; OOM retries halve it |
 | `--num-augment` | `8` | leave it; `dihedral8` requires exactly 8 |

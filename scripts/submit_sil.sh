@@ -25,10 +25,13 @@
 #SBATCH --output=%x-%j.out
 #SBATCH --error=%x-%j.err
 #
-# Runtime note: at the measured generation rate (~30 min per 1000 instances for WOR, ~12 min for
-# beam-128) the default 150 SIL epochs are ~75 h for WOR and ~30 h for beam. If the partition
-# caps the job below that, lower NUM_INSTANCES_TO_GENERATE to 500 in the notebook (both arms
-# together, to keep the comparison matched) rather than raising the wall clock.
+# Runtime note: at the measured generation rate on the development GPU (~6 min per 1000
+# instances for WOR, ~2 min for beam-128) the default 150 SIL epochs are ~15 h for WOR and ~5 h
+# for beam. Measure the training GPU first with
+#     .venv/bin/python scripts/benchmark_sil_generation.py --search-type wor
+# If the partition caps the job below that, lower NUM_INSTANCES_TO_GENERATE to 500 in the
+# notebook (both arms together, to keep the comparison matched) rather than raising the wall
+# clock.
 
 #------------------------
 # Environment setup

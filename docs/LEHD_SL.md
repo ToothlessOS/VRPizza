@@ -152,6 +152,7 @@ run the smoke and a short pilot first.
 .venv/bin/python notebooks/eval_rrc.py --datasets vrp100_test_lkh             # main run
 .venv/bin/python notebooks/eval_rrc.py --num-augment 1 --num-starts 1         # no multipliers
 .venv/bin/python notebooks/eval_rrc.py --rrc-init greedy                      # LEHD protocol
+.venv/bin/python notebooks/eval_rrc.py --checkpoint-dir checkpoints_rl_sil_100 # custom checkpoints
 .venv/bin/python notebooks/eval_rrc.py --report-from logs/eval_rrc/results.npz
 ```
 

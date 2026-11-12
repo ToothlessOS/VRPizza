@@ -40,6 +40,7 @@ from src.sil.incremental_sbs import (  # noqa: E402
 from src.sil.sbs import (  # noqa: E402
     BeamLeaf,
     sample_gumbels_with_maximum,
+    sample_gumbels_with_maximum_flat,
     stochastic_beam_search,
 )
 from src.sil.search import SILSearchConfig, generate_best_solutions  # noqa: E402
@@ -286,6 +287,14 @@ def check_adapter(env, model, generated) -> None:
     check("a single customer does not finish the episode", not is_leaf)
     check("the child records the action", child.actions == (action,))
 
+    action2 = int(np.flatnonzero(child.mask)[0])
+    grandchild, _ = adapter.child_transition_fn([(child, action2)])[0]
+    check(
+        "actions accumulate across steps",
+        grandchild.actions == (action, action2),
+        f"{grandchild.actions}",
+    )
+
 
 def check_leaf_costs(env, model, generated) -> None:
     section("Leaf costs equal env.get_reward")
@@ -314,6 +323,169 @@ def check_leaf_costs(env, model, generated) -> None:
             )
             checked += 1
     check("both instances were checked", checked >= 2, f"{checked} leaves")
+
+
+def check_flat_gumbels() -> None:
+    section("Flat Gumbel sampling")
+    log_probs = [
+        np.array([-0.2, -1.3, -4.0]),
+        np.array([-0.1]),
+        np.array([-2.0, -0.5]),
+        np.array([-3.0, -3.1, -0.7, -9.0]),
+    ]
+    targets = np.array([0.4, -0.3, 1.2, -0.8])
+    counts = np.array([len(array) for array in log_probs])
+    flat = np.concatenate(log_probs)
+
+    sequential_rng = np.random.default_rng(11)
+    sequential = np.concatenate(
+        [
+            sample_gumbels_with_maximum(array, target, rng=sequential_rng)
+            for array, target in zip(log_probs, targets)
+        ]
+    )
+    flat_rng = np.random.default_rng(11)
+    batched = sample_gumbels_with_maximum_flat(
+        flat, np.repeat(targets, counts), counts, rng=flat_rng
+    )
+    check("flat Gumbels equal the per-node draws", np.array_equal(sequential, batched))
+    check(
+        "the RNG state after the draw is unchanged",
+        np.array_equal(sequential_rng.random(4), flat_rng.random(4)),
+    )
+    offset = 0
+    segment_ok = True
+    for count, target in zip(counts, targets):
+        segment_ok &= bool(np.isclose(batched[offset : offset + count].max(), target))
+        offset += count
+    check("each segment's maximum is its own target", segment_ok)
+
+
+def check_grouped_decoder(env, model, generated) -> None:
+    section("Grouped decoder parity with the per-row cache path")
+    root_td = env.reset(generated.clone())
+    flat_adapter = SILSearchAdapter(
+        model.policy, env, root_td, device="cpu", grouped_decoder=False
+    )
+    grouped_adapter = SILSearchAdapter(
+        model.policy, env, root_td, device="cpu", grouped_decoder=True
+    )
+    roots = flat_adapter.root_states(root_td)
+
+    cases = {
+        "ragged repeats": [roots[0], roots[0], roots[1], roots[2], roots[2], roots[2]],
+        "one state per instance (K=1 padded)": list(roots),
+        "subset of instances (WOR round 2+)": [roots[1], roots[2], roots[2]],
+    }
+    for name, states in cases.items():
+        flat = np.stack(flat_adapter.child_log_probability_fn(states))
+        grouped = np.stack(grouped_adapter.child_log_probability_fn(states))
+        finite = np.isfinite(flat)
+        check(
+            f"{name}: finite log-probs match",
+            np.allclose(flat[finite], grouped[finite], atol=1e-5),
+            f"max |diff| {np.abs(flat[finite] - grouped[finite]).max():.2e}",
+        )
+        check(
+            f"{name}: infeasible mask matches",
+            np.array_equal(finite, np.isfinite(grouped)),
+        )
+
+
+def check_batched_transitions(env, model, generated) -> None:
+    section("Batched transition parity with per-instance calls")
+    root_td = env.reset(generated.clone())
+    adapter = SILSearchAdapter(model.policy, env, root_td, device="cpu")
+    roots = adapter.root_states(root_td)
+    # Grouped by instance so the per-instance concatenation and the batched call see the pairs
+    # in the same order.
+    pairs = []
+    for batch_idx in range(BATCH):
+        pairs.extend(
+            (roots[batch_idx], 1 + ((batch_idx * 5 + step * 7) % NUM_LOC))
+            for step in range(8)
+        )
+
+    per_instance = []
+    for batch_idx in range(BATCH):
+        per_instance.extend(
+            adapter.child_transition_fn(
+                [pair for pair in pairs if pair[0].instance == batch_idx]
+            )
+        )
+    batched = adapter.child_transition_fn(pairs)
+
+    fields_match = all(
+        per[1] == both[1]
+        and per[0].current == both[0].current
+        and per[0].cost == both[0].cost
+        and np.array_equal(per[0].visited, both[0].visited)
+        and np.array_equal(per[0].mask, both[0].mask)
+        and per[0].actions == both[0].actions
+        for per, both in zip(per_instance, batched)
+    )
+    check("batched transition equals the per-instance transitions", fields_match)
+
+
+def check_trie_counter() -> None:
+    section("Trie exhaustion counter")
+    searcher = IncrementalSBS(
+        initial_states=[()],
+        child_log_probability_fn=toy_log_probability_fn,
+        child_transition_fn=toy_transition_fn,
+        leaf_evaluation_fn=toy_leaf_eval,
+    )
+    searcher.perform_incremental_sbs(
+        beam_width=TREE_BEAM,
+        num_rounds=TREE_ROUNDS,
+        log_prob_update_type="wor",
+        rng=np.random.default_rng(5),
+    )
+
+    mismatches = 0
+    visited_nodes = 0
+    stack = [searcher.root_nodes[0][0]]
+    while stack:
+        node = stack.pop()
+        visited_nodes += 1
+        if node.children is not None and not len(node.children):
+            slow = True  # A terminal leaf.
+        elif node.unsampled_log_masses is None:
+            slow = False  # Never expanded.
+        else:
+            slow = bool(np.all(np.isneginf(node.unsampled_log_masses)))
+        if node.exhausted() != slow:
+            mismatches += 1
+        if node.children:
+            stack.extend(child for child in node.children if child is not None)
+
+    check(
+        "O(1) exhausted() matches the residual-mass scan",
+        mismatches == 0,
+        f"{mismatches} mismatches over {visited_nodes} nodes",
+    )
+
+
+def check_generation_reproducible(env, model) -> None:
+    section("Generation reproducibility")
+    cfg = SILSearchConfig(
+        search_type="beam_search",
+        beam_width=2,
+        num_rounds=1,
+        chunk_size=BATCH,
+        seed=3,
+    )
+    first, _ = generate_best_solutions(model.policy, env, BATCH, cfg, device="cpu")
+    second, _ = generate_best_solutions(model.policy, env, BATCH, cfg, device="cpu")
+    check(
+        "the same seed reproduces the same tours",
+        [record.tour.tolist() for record in first]
+        == [record.tour.tolist() for record in second],
+    )
+    check(
+        "the same seed reproduces the same costs",
+        [record.cost for record in first] == [record.cost for record in second],
+    )
 
 
 def check_generation_and_dataset(env, model, generated) -> None:
@@ -370,11 +542,16 @@ def main() -> int:
     check_deterministic_beam()
     check_without_replacement()
     check_dormant_updates()
+    check_flat_gumbels()
+    check_trie_counter()
 
     env, model, generated = build_case()
     print(f"\nCVRP verification: N={NUM_LOC}, batch={BATCH}")
     check_adapter(env, model, generated)
+    check_grouped_decoder(env, model, generated)
+    check_batched_transitions(env, model, generated)
     check_leaf_costs(env, model, generated)
+    check_generation_reproducible(env, model)
     check_generation_and_dataset(env, model, generated)
 
     print()

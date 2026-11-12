@@ -95,6 +95,99 @@ def top_p_filtering(log_probs: np.ndarray, top_p: float) -> np.ndarray:
     return log_probs
 
 
+def sample_gumbels_with_maximum_flat(
+    log_probabilities: np.ndarray,
+    target_max: np.ndarray,
+    counts: np.ndarray,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """Vectorised :func:`sample_gumbels_with_maximum` over a flat concatenation of nodes.
+
+    Args:
+        log_probabilities: ``[C]`` feasible log-probabilities, concatenated node by node.
+        target_max: ``[C]`` target maximum for each entry, i.e. the parent Gumbel repeated for
+            every feasible child of that parent.
+        counts: ``[n_nodes]`` number of concatenated entries per node (all positive).
+        rng: Optional NumPy generator.
+
+    Returns:
+        ``[C]`` Gumbels conditioned on each node's own maximum.
+
+    The draw is one ``rng.gumbel`` call over the concatenated array. That consumes exactly the
+    same random stream as calling :func:`sample_gumbels_with_maximum` per node (verified), which
+    keeps a seeded run reproducible. The per-node maximum is a segmented reduction: one global
+    maximum would be wrong, and padding a ragged ``[n_nodes, A]`` block would consume extra
+    draws.
+    """
+    rng = np.random if rng is None else rng
+    if log_probabilities.size == 0:
+        return log_probabilities
+
+    gumbels = rng.gumbel(loc=log_probabilities)
+    starts = np.concatenate(([0], np.cumsum(counts)[:-1]))
+    segment_max = np.maximum.reduceat(gumbels, starts)
+    max_per_entry = np.repeat(segment_max, counts)
+
+    # Same expression as the scalar version, elementwise over the flat array.
+    with np.errstate(divide="ignore"):
+        v = target_max - gumbels + np.log1p(-np.exp(gumbels - max_per_entry))
+        return target_max - np.maximum(v, 0) - np.log1p(np.exp(-np.abs(v)))
+
+
+def _assemble_candidates(
+    child_log_probs_list: List[np.ndarray],
+    node_log_probs: List[float],
+    node_gumbels: List[float],
+    deterministic: bool,
+    rng: np.random.Generator | None,
+):
+    """Flatten one instance's candidate children in node/action order, vectorised.
+
+    Returns ``(log_probs, gumbels, parent_indices, actions)`` NumPy arrays, or ``None`` when the
+    children cannot be stacked (ragged action counts, or node log-probabilities of mixed Python /
+    NumPy scalar types, where the scalar path's promotion rules cannot be reproduced in one
+    array). The caller falls back to the per-node loop in that case.
+
+    Values and ordering match the per-node loop exactly: children are node-major and
+    action-ascending, which is what ``np.argpartition`` below consumes.
+    """
+    if not child_log_probs_list:
+        return None
+    shape = child_log_probs_list[0].shape
+    dtype = child_log_probs_list[0].dtype
+    if any(array.shape != shape or array.dtype != dtype for array in child_log_probs_list):
+        return None
+
+    # Reproduce the scalar addition's dtype: a Python float is a *weak* scalar under NEP 50 and
+    # keeps the children's dtype; a NumPy scalar promotes as usual.
+    if all(type(value) is float for value in node_log_probs):
+        node_term = np.asarray(node_log_probs, dtype=dtype)
+    elif all(isinstance(value, np.generic) for value in node_log_probs):
+        node_term = np.asarray(node_log_probs)
+    else:
+        return None
+
+    stacked = np.stack(child_log_probs_list)
+    sums = stacked + node_term[:, None]
+    feasible = np.isfinite(sums)
+    counts = feasible.sum(axis=1)
+    if np.any(counts == 0):
+        # The scalar path raises inside `np.max`; surface the malformed tree clearly instead.
+        raise RuntimeError(
+            "a search node has no feasible action; the search tree is malformed"
+        )
+
+    log_probs = sums[feasible]
+    actions = np.nonzero(feasible)[1]
+    parent_indices = np.repeat(np.arange(len(child_log_probs_list)), counts)
+    if deterministic:
+        gumbels = log_probs
+    else:
+        targets = np.repeat(np.asarray(node_gumbels, dtype=np.float64), counts)
+        gumbels = sample_gumbels_with_maximum_flat(log_probs, targets, counts, rng)
+    return log_probs, gumbels, parent_indices, actions
+
+
 def stochastic_beam_search(
     child_log_probability_fn: Callable[[List[State]], List[np.ndarray]],
     child_transition_fn: Callable[[List[Tuple[State, int]]], List[Tuple[State, bool]]],
@@ -118,7 +211,9 @@ def stochastic_beam_search(
             log-probability arrays, one per state. Infeasible actions must be ``-inf``.
         child_transition_fn: Maps a list of ``(state, action_index)`` pairs to
             ``(child_state, is_leaf)`` pairs. A leaf state is a complete trajectory and is
-            returned by the search rather than expanded.
+            returned by the search rather than expanded. One call carries the selected
+            expansions of **every** instance at that level, so the callback must be
+            row-independent: a pair's result may not depend on the other pairs or their order.
         root_states: ``B`` root states; roots may not be leaves.
         beam_width: Number of leaves to keep per instance.
         deterministic: If true, use cumulative log-probability instead of Gumbels, which
@@ -168,93 +263,160 @@ def stochastic_beam_search(
             flat_child_log_probs_list = flat_child_log_probs_list[len(internal_states) :]
         assert not flat_child_log_probs_list, "Flat child log probs list should be empty"
 
+        # Candidate selection and top-k pruning per instance, then a single transition call for
+        # the whole level. The transition callbacks are required to be row-independent (the CVRP
+        # adapter and the verifier's toy callback both are), so grouping the pairs changes only
+        # how many Python/device round trips the level costs -- not the results.
+        pending = []
         for batch_idx in range(batch_len):
             if not len(batch_child_log_probs_list[batch_idx]):
                 continue  # This instance is already finished.
 
-            all_log_probs = []
-            all_gumbels = []
-            all_states = []  # Parent state of each flattened candidate.
-            all_child_indices = []
+            state_list = batch_internal_states[batch_idx]
 
-            for node_state, node_log_prob, node_gumbel, child_log_probs in zip(
-                batch_internal_states[batch_idx],
-                batch_internal_log_probs[batch_idx],
-                batch_internal_gumbels[batch_idx],
-                batch_child_log_probs_list[batch_idx],
-            ):
-                if 1 > top_p > 0:
-                    child_log_probs = top_p_filtering(child_log_probs.copy(), top_p)
-                    with np.errstate(divide="ignore"):
-                        child_log_probs = np.log(softmax(child_log_probs))
-                log_probabilities = child_log_probs + node_log_prob
-                # Keep only feasible actions. `isfinite` also rejects a NaN that a corrupt
-                # state could produce; `!= -inf` would let it through.
-                good_indices = np.where(np.isfinite(log_probabilities))[0]
-                log_probabilities = log_probabilities[good_indices]
-                if deterministic:
-                    gumbels = log_probabilities
-                else:
-                    gumbels = sample_gumbels_with_maximum(
-                        log_probabilities, node_gumbel, rng=rng
-                    )
+            # Fast path: one stacked candidate assembly for all of this instance's nodes.
+            # `top_p` is disabled in the supported arms, so the per-node branch keeps it.
+            assembled = None
+            if not (1 > top_p > 0):
+                assembled = _assemble_candidates(
+                    batch_child_log_probs_list[batch_idx],
+                    batch_internal_log_probs[batch_idx],
+                    batch_internal_gumbels[batch_idx],
+                    deterministic,
+                    rng,
+                )
 
-                all_log_probs.extend(log_probabilities)
-                all_gumbels.extend(gumbels)
-                all_states.extend([node_state] * len(log_probabilities))
-                all_child_indices.extend(good_indices)
+            if assembled is not None:
+                all_log_probs, all_gumbels, parent_indices, all_child_indices = assembled
+                num_internal_candidates = int(all_log_probs.size)
+
+                def pair_at(
+                    index,
+                    _states=state_list,
+                    _parents=parent_indices,
+                    _actions=all_child_indices,
+                ):
+                    return (_states[_parents[index]], int(_actions[index]))
+
+            else:
+                all_log_probs = []
+                all_gumbels = []
+                all_states = []  # Parent state of each flattened candidate.
+                all_child_indices = []
+
+                for node_state, node_log_prob, node_gumbel, child_log_probs in zip(
+                    batch_internal_states[batch_idx],
+                    batch_internal_log_probs[batch_idx],
+                    batch_internal_gumbels[batch_idx],
+                    batch_child_log_probs_list[batch_idx],
+                ):
+                    if 1 > top_p > 0:
+                        child_log_probs = top_p_filtering(child_log_probs.copy(), top_p)
+                        with np.errstate(divide="ignore"):
+                            child_log_probs = np.log(softmax(child_log_probs))
+                    log_probabilities = child_log_probs + node_log_prob
+                    # Keep only feasible actions. `isfinite` also rejects a NaN that a corrupt
+                    # state could produce; `!= -inf` would let it through.
+                    good_indices = np.where(np.isfinite(log_probabilities))[0]
+                    log_probabilities = log_probabilities[good_indices]
+                    if deterministic:
+                        gumbels = log_probabilities
+                    else:
+                        gumbels = sample_gumbels_with_maximum(
+                            log_probabilities, node_gumbel, rng=rng
+                        )
+
+                    all_log_probs.extend(log_probabilities)
+                    all_gumbels.extend(gumbels)
+                    all_states.extend([node_state] * len(log_probabilities))
+                    all_child_indices.extend(good_indices)
+
+                num_internal_candidates = len(all_gumbels)
+
+                def pair_at(index, _states=all_states, _actions=all_child_indices):
+                    return (_states[index], _actions[index])
 
             # Combine the new children with the leaves already on the beam and keep the top k.
             leaf_gumbels = batch_leaf_gumbels[batch_idx]
             leaf_log_probs = batch_leaf_log_probs[batch_idx]
             leaf_states = batch_leaf_states[batch_idx]
-            num_internal_candidates = len(all_gumbels)
             num_leaf_candidates = len(leaf_gumbels)
             if beam_width >= num_internal_candidates + num_leaf_candidates:
                 # Everything fits: no existing leaf is dropped.
-                to_expand_states = list(zip(all_states, all_child_indices))
+                to_expand_states = [pair_at(i) for i in range(num_internal_candidates)]
                 to_expand_log_probs = all_log_probs
                 to_expand_gumbels = all_gumbels
             else:
-                all_gumbels.extend(leaf_gumbels)
-                top_k_indices = np.argpartition(all_gumbels, -k)[-k:]
-                to_expand_states = []
-                to_expand_log_probs = []
-                to_expand_gumbels = []
+                if assembled is not None:
+                    if leaf_gumbels:
+                        combined = np.concatenate(
+                            (
+                                all_gumbels,
+                                np.asarray(leaf_gumbels, dtype=all_gumbels.dtype),
+                            )
+                        )
+                    else:
+                        combined = all_gumbels
+                else:
+                    all_gumbels.extend(leaf_gumbels)
+                    combined = all_gumbels
+                top_k_indices = np.argpartition(combined, -k)[-k:]
+                internal_indices = []
                 leaf_indices = []  # Existing leaves that persist.
                 for i in top_k_indices:
                     if i >= num_internal_candidates:
                         leaf_indices.append(i - num_internal_candidates)
                     else:
-                        to_expand_states.append((all_states[i], all_child_indices[i]))
-                        to_expand_log_probs.append(all_log_probs[i])
-                        to_expand_gumbels.append(all_gumbels[i])
+                        internal_indices.append(i)
+                to_expand_states = [pair_at(i) for i in internal_indices]
+                if assembled is not None:
+                    selection = np.asarray(internal_indices, dtype=np.intp)
+                    to_expand_log_probs = all_log_probs[selection]
+                    to_expand_gumbels = all_gumbels[selection]
+                else:
+                    to_expand_log_probs = [all_log_probs[i] for i in internal_indices]
+                    to_expand_gumbels = [all_gumbels[i] for i in internal_indices]
 
                 leaf_log_probs = [leaf_log_probs[i] for i in leaf_indices]
                 leaf_gumbels = [leaf_gumbels[i] for i in leaf_indices]
                 leaf_states = [leaf_states[i] for i in leaf_indices]
 
-            # Expand the selected non-leaf candidates.
-            internal_log_probs = []
-            internal_gumbels = []
-            internal_states = []
-            if len(to_expand_states):
-                child_states = child_transition_fn(to_expand_states)
-                for log_prob, gumbel, (child_state, is_leaf) in zip(
-                    to_expand_log_probs, to_expand_gumbels, child_states
-                ):
-                    if is_leaf:
-                        leaf_log_probs.append(log_prob)
-                        leaf_gumbels.append(gumbel)
-                        leaf_states.append(child_state)
-                    else:
-                        internal_log_probs.append(log_prob)
-                        internal_gumbels.append(gumbel)
-                        internal_states.append(child_state)
-
+            # Persist the pruned beam before expanding, so the split below only appends.
             batch_leaf_log_probs[batch_idx] = leaf_log_probs
             batch_leaf_gumbels[batch_idx] = leaf_gumbels
             batch_leaf_states[batch_idx] = leaf_states
+            pending.append(
+                (batch_idx, to_expand_states, to_expand_log_probs, to_expand_gumbels)
+            )
+
+        # Expand every selected non-leaf candidate in one call across all instances.
+        flat_expand = [pair for _, pairs, _, _ in pending for pair in pairs]
+        flat_child_states = child_transition_fn(flat_expand) if flat_expand else []
+
+        offset = 0
+        for batch_idx, pairs, to_expand_log_probs, to_expand_gumbels in pending:
+            count = len(pairs)
+            child_states = flat_child_states[offset : offset + count]
+            offset += count
+
+            leaf_log_probs = batch_leaf_log_probs[batch_idx]
+            leaf_gumbels = batch_leaf_gumbels[batch_idx]
+            leaf_states = batch_leaf_states[batch_idx]
+            internal_log_probs = []
+            internal_gumbels = []
+            internal_states = []
+            for log_prob, gumbel, (child_state, is_leaf) in zip(
+                to_expand_log_probs, to_expand_gumbels, child_states
+            ):
+                if is_leaf:
+                    leaf_log_probs.append(log_prob)
+                    leaf_gumbels.append(gumbel)
+                    leaf_states.append(child_state)
+                else:
+                    internal_log_probs.append(log_prob)
+                    internal_gumbels.append(gumbel)
+                    internal_states.append(child_state)
+
             batch_internal_log_probs[batch_idx] = internal_log_probs
             batch_internal_gumbels[batch_idx] = internal_gumbels
             batch_internal_states[batch_idx] = internal_states

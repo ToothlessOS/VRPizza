@@ -21,6 +21,7 @@ Run it with the project's virtualenv::
     .venv/bin/python notebooks/eval_rrc.py --limit 8 --rrc-budgets 1 2 5
     .venv/bin/python notebooks/eval_rrc.py --datasets vrp100_test_lkh
     .venv/bin/python notebooks/eval_rrc.py --num-augment 1 --num-starts 1
+    .venv/bin/python notebooks/eval_rrc.py --checkpoint-dir checkpoints_rl_sil_100
     .venv/bin/python notebooks/eval_rrc.py --report-from logs/eval_rrc/results.npz
 
 The reconstruction always runs a single greedy trajectory: the window's start is fixed by the
@@ -48,9 +49,9 @@ from src.rrc import RRCConfig, RRCStats, run_rrc
 from notebooks.eval_pomo import (
     batch_size_for,
     build_batch,
-    discover_checkpoints,
     discover_datasets,
     load_model,
+    select_checkpoints,
     should_normalize,
     summarize,
 )
@@ -65,6 +66,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--datasets", nargs="*", default=None, help="file stems to evaluate (default: all)"
     )
     parser.add_argument("--checkpoints", nargs="*", default=None, help="labels, e.g. lehd rl")
+    parser.add_argument(
+        "--checkpoint-dir",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help="directory of runs (or a run directory, or a .ckpt) to evaluate; repeatable, and "
+        "replaces the default checkpoints/ scan",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        action="append",
+        default=None,
+        metavar="LABEL=PATH",
+        help="an explicit checkpoint to evaluate under LABEL; repeatable. A bare PATH takes "
+        "its label from the run directory's prefix. Replaces the directory scan, which is "
+        "what lets two runs of one family be evaluated side by side",
+    )
     parser.add_argument("--limit", type=int, default=None, help="instances per dataset")
     parser.add_argument("--batch-size", type=int, default=None, help="override the per-N batch")
     parser.add_argument(
@@ -313,7 +331,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     torch.set_float32_matmul_precision("medium")
-    checkpoints = discover_checkpoints()
+    checkpoints = select_checkpoints(args.checkpoint_dir, args.checkpoint)
     if args.checkpoints:
         unknown = [label for label in args.checkpoints if label not in checkpoints]
         if unknown:
