@@ -40,8 +40,8 @@ prefix, because that is what selects the Lightning module; the rest of it is you
 ```bash
 .venv/bin/python notebooks/eval_pomo.py \
     --checkpoint sil_w50=checkpoints_rl_sil_100/sil-wor-vrp100-lr-0.0001-wd-1e-06-k32x4-n1000-S256x100-w50/last.ckpt \
-    --checkpoint lehd_rl=checkpoints_rl_sil_100/lehd_rl_shared-vrp100-lr-0.0001-wd-1e-06-B-1024-shared-K-4-w-4-100/epoch_094.ckpt \
-    --checkpoint lehd_rl_shared=checkpoints_rl_sil_100/lehd_rl-vrp100-lr-0.0001-wd-1e-06-B-1024-teacher-K-1-w-4-100/epoch_094.ckpt
+    --checkpoint lehd_rl=checkpoints_rl_sil_100/lehd_rl-vrp100-lr-0.0001-wd-1e-06-B-1024-teacher-K-1-w-4-100/epoch_094.ckpt \
+    --checkpoint lehd_rl_shared=checkpoints_rl_sil_100/lehd_rl_shared-vrp100-lr-0.0001-wd-1e-06-B-1024-shared-K-4-w-4-100/epoch_094.ckpt
 ```
 
 `--checkpoint` and `--checkpoint-dir` are alternatives, not additive: a scan and a named run
@@ -79,6 +79,7 @@ eight instances the mean gap is 69.4% unscaled against 4.4% rescaled.
 | `--checkpoints` | every one found | labels to keep from those selected, e.g. `rl sl` |
 | `--checkpoint-dir` | `checkpoints/` | where to scan; repeatable, replaces the default |
 | `--checkpoint` | none | `LABEL=PATH`; repeatable, replaces the scan and allows custom labels |
+| `--select` | `last` | `last` evaluates `last.ckpt`; `best` resolves each run's best `val/reward` checkpoint from its callbacks |
 | `--limit` | none | instances per dataset, taken from the front |
 | `--batch-size` | per-`N` table | overrides `BATCH_BY_N`; OOM retries halve it |
 | `--num-augment` | `8` | leave it; `dihedral8` requires exactly 8 |

@@ -354,8 +354,36 @@ def parse_checkpoint_spec(spec: str) -> tuple[str, Path]:
     return label, checkpoint
 
 
+def best_checkpoint(checkpoint: Path) -> Path:
+    """Resolve a run's best ``val/reward`` checkpoint from its ``last.ckpt``.
+
+    Lightning stores the ``ModelCheckpoint`` state under a dynamic key such as
+    ``ModelCheckpoint{'monitor': 'val/reward', ...}``, so the key is found by prefix. The stored
+    ``best_model_path`` is absolute on the training host; only its basename is portable, and it
+    is re-rooted beside the checkpoint being read.
+    """
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    callbacks = state.get("callbacks", {})
+    for key, value in callbacks.items():
+        if not key.startswith("ModelCheckpoint"):
+            continue
+        best = value.get("best_model_path")
+        if not best:
+            continue
+        candidate = checkpoint.parent / Path(best).name
+        if not candidate.is_file():
+            raise FileNotFoundError(
+                f"{checkpoint.parent.name}: best checkpoint {Path(best).name} is not beside "
+                f"{checkpoint.name}; copy it from the training host or pass it explicitly"
+            )
+        return candidate
+    raise ValueError(f"{checkpoint} carries no ModelCheckpoint best_model_path")
+
+
 def select_checkpoints(
-    checkpoint_dirs: list[str] | None, checkpoint_specs: list[str] | None
+    checkpoint_dirs: list[str] | None,
+    checkpoint_specs: list[str] | None,
+    select: str = "last",
 ) -> dict[str, Path]:
     """Resolve the checkpoint set from the two mutually exclusive selection flags.
 
@@ -366,6 +394,8 @@ def select_checkpoints(
     Args:
         checkpoint_dirs: The ``--checkpoint-dir`` values, if any.
         checkpoint_specs: The ``--checkpoint`` values (``LABEL=PATH`` or a bare path), if any.
+        select: ``"last"`` keeps the resolved checkpoints; ``"best"`` replaces each with the
+            run's best ``val/reward`` checkpoint, resolved by :func:`best_checkpoint`.
 
     Returns:
         Label to checkpoint path.
@@ -391,9 +421,15 @@ def select_checkpoints(
                     f"({selected[label]}, {checkpoint}); labels must be unique"
                 )
             selected[label] = checkpoint
-        return selected
-    roots = [resolve_path(root) for root in checkpoint_dirs] if checkpoint_dirs else None
-    return discover_checkpoints(roots)
+    else:
+        roots = [resolve_path(root) for root in checkpoint_dirs] if checkpoint_dirs else None
+        selected = discover_checkpoints(roots)
+
+    if select == "best":
+        selected = {label: best_checkpoint(path) for label, path in selected.items()}
+    elif select != "last":
+        raise SystemExit(f"--select must be 'last' or 'best', got {select!r}")
+    return selected
 
 
 def natural_key(name: str) -> tuple:
@@ -1039,6 +1075,12 @@ def main(argv: list[str] | None = None) -> int:
         "its label from the run directory's prefix. Replaces the directory scan, which is "
         "what lets two runs of one family be evaluated side by side",
     )
+    parser.add_argument(
+        "--select",
+        choices=("last", "best"),
+        default="last",
+        help="evaluate the resolved last.ckpt or each run's best val/reward checkpoint",
+    )
     parser.add_argument("--limit", type=int, default=None, help="instances per dataset")
     parser.add_argument("--batch-size", type=int, default=None, help="override the per-N batch")
     parser.add_argument("--num-augment", type=int, default=NUM_AUGMENT)
@@ -1089,7 +1131,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.report_from:
         return report(np.load(args.report_from))
 
-    checkpoints = select_checkpoints(args.checkpoint_dir, args.checkpoint)
+    checkpoints = select_checkpoints(args.checkpoint_dir, args.checkpoint, select=args.select)
     if args.checkpoints:
         unknown = [c for c in args.checkpoints if c not in checkpoints]
         if unknown:
@@ -1097,7 +1139,10 @@ def main(argv: list[str] | None = None) -> int:
         checkpoints = {k: v for k, v in checkpoints.items() if k in args.checkpoints}
 
     datasets = discover_datasets(args.datasets)
-    print(f"checkpoints: {', '.join(f'{k} ({v.parent.name})' for k, v in checkpoints.items())}")
+    print(
+        "checkpoints: "
+        + ", ".join(f"{k} ({v.parent.name}/{v.name})" for k, v in checkpoints.items())
+    )
     print(f"datasets:    {', '.join(name for name, _ in datasets)}")
     starts_label = "N" if args.num_starts is None else str(args.num_starts)
     print(

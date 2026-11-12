@@ -188,7 +188,7 @@ matched model evaluations.
 .venv/bin/python scripts/verify_lehd_data.py   # geometry, draw, workers, teacher forcing
 .venv/bin/python scripts/verify_rrc.py         # rollout/replay, monotonicity, extremes, parity
 .venv/bin/python scripts/verify_sl_data.py     # unchanged pipeline still passes
-.venv/bin/python scripts/verify_synced_data.py
+.venv/bin/python scripts/verify_comparison.py
 .venv/bin/python scripts/verify_val_parity.py
 ```
 

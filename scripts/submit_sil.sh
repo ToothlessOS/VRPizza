@@ -8,7 +8,7 @@
 # WOR-SBS). Running them concurrently keeps their epoch counts aligned.
 #
 # Generation runs inside the training process (no Ray, no extra workers), so the host-memory
-# problem in submit_sync.sh does not apply: the SIL DataLoader uses zero workers and the record
+# problem in submit_comparison.sh does not apply: the SIL DataLoader uses zero workers and the record
 # pool is a few thousand small NumPy arrays. The GPU is the constraint, and the search is the
 # expensive part -- `NUM_INSTANCES_TO_GENERATE`, `BEAM_WIDTH` and `NUM_ROUNDS` in the notebook
 # are the knobs to lower first if an epoch takes too long.

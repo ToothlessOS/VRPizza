@@ -221,7 +221,7 @@ constant `K(prefix, s)`.
 .venv/bin/python scripts/verify_lehd_rl.py
 .venv/bin/python scripts/verify_lehd_data.py
 .venv/bin/python scripts/verify_rrc.py
-.venv/bin/python scripts/verify_synced_data.py
+.venv/bin/python scripts/verify_comparison.py
 .venv/bin/python scripts/verify_val_parity.py
 ```
 
