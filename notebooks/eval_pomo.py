@@ -77,7 +77,14 @@ from tensordict.tensordict import TensorDict
 
 from src.envs import EvalCVRPEnv, InstanceSet, load_instances, project_root
 from src.mcts import POMOMCTSConfig, SearchStatistics, solve_batch_with_pomo_mcts
-from src.models import LEHDPOMORL, LEHDPOMOSL, POMORL, POMOSIL, POMOSL
+from src.models import (
+    LEHDPOMORL,
+    LEHDPOMOSL,
+    POMORL,
+    POMOSIL,
+    POMOSL,
+    SILRCLEHDLitModule,
+)
 
 # --------------------------------------------------------------------------------------
 # Configuration
@@ -107,6 +114,16 @@ MODEL_CLASSES = {
     # Self-improvement learning: the same policy network, trained by an RL warm-up followed by
     # teacher forcing on self-generated pseudo-experts.
     "sil": POMOSIL,
+    # Local-reconstruction SIL. Same policy graph as every POMO run; only the training loop
+    # differs, so POMORL (weights + shared inference) is the right loader. The longest-prefix
+    # match keeps it distinct from "sil".
+    "sil_rc": POMORL,
+    # LEHD backbone, same SIL-RC pipeline. The two run labels are separate because
+    # `discover_checkpoints` keys on the text before the first "-", and the strict and
+    # step-matched arms live under different roots but must not collide if both are
+    # listed explicitly.
+    "lehd_sil_rc": SILRCLEHDLitModule,
+    "lehd_sil_rc_step": SILRCLEHDLitModule,
 }
 
 #: Suffix a result label carries when the search produced it.
@@ -674,9 +691,10 @@ def load_model(
     Args:
         label: The run's label, resolved to a module by :func:`model_class_for`.
         checkpoint: Path to the ``.ckpt``.
-        env: The environment to attach. Only its ``name`` matters at construction -- the
-            network is built from the environment's name plus rl4co's POMO defaults, which
-            both training scripts used -- but it is attached so the mixin finds it and is
+        env: The environment to attach. The module class decides the network --
+            the POMO-family classes build rl4co's POMO policy from the
+            environment's name, while ``SILRCLEHDLitModule`` builds the LEHD
+            encoder/decoder -- but it is attached so the mixin finds it and is
             replaced per customer count as evaluation proceeds.
         device: Torch device.
         num_augment: Dihedral augmentations to validate with. Must match what the model counts
@@ -743,6 +761,18 @@ def evaluate(
         label to its cost accounting.
     """
     total = len(inst)
+    if search_cfg is not None:
+        unsupported = [
+            label
+            for label, model in models.items()
+            if isinstance(model, SILRCLEHDLitModule)
+        ]
+        if unsupported:
+            raise ValueError(
+                f"--mcts reaches into POMO's encoder/decoder cache and is not supported "
+                f"for the LEHD backbone ({', '.join(sorted(unsupported))}); evaluate it "
+                "with the plain rollout or notebooks/eval_rrc.py"
+            )
     labels = [
         method_label(label, searched)
         for label in models

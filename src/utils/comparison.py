@@ -1,4 +1,4 @@
-"""The shared step budget for the four step-matched POMO training arms.
+"""The shared step budget for the step-matched POMO training arms.
 
 The comparison is defined per optimizer step, not per dataset: every arm decodes 2,000
 sequences per update (125 instances x 16 examples), runs 100 updates per epoch, and runs 200
@@ -59,6 +59,26 @@ SHARED_PARTIALS_PER_STEP = SAMPLES_PER_STEP // SHARED_K  # 500
 SHARED_MICRO_BATCH = 500
 SHARED_ACCUM = 1
 SHARED_ROWS_PER_EPOCH = TRAIN_INSTANCES_PER_EPOCH * SHARED_PARTIALS_PER_INSTANCE  # 50,000
+
+# -- SIL-RC (self-improvement by local reconstruction) -------------------------------------
+# The warm-up consumes the first 50 epochs / 5,000 steps; the supervised phase is the
+# remaining 150 epochs / 15,000 steps, split into five 30-epoch label cycles. The label
+# set is 12,500 instances per cycle with 16 partial windows each, so one epoch is
+# 200,000 rows and one optimizer step is still 2,000 partials.
+SIL_RC_WARMUP_EPOCHS = 50
+SIL_RC_EPOCHS = 150
+SIL_RC_CYCLE_EPOCHS = 30
+SIL_RC_CYCLES = SIL_RC_EPOCHS // SIL_RC_CYCLE_EPOCHS  # 5
+SIL_RC_INSTANCES_PER_CYCLE = 12_500
+SIL_RC_PARTIALS_PER_INSTANCE = 16
+SIL_RC_ROWS_PER_EPOCH = SIL_RC_INSTANCES_PER_CYCLE * SIL_RC_PARTIALS_PER_INSTANCE  # 200,000
+SIL_RC_RECON_ITERATIONS = 100
+SIL_RC_MICRO_BATCH = 500
+SIL_RC_ACCUM = 4
+SIL_RC_WARMUP_MICRO_INSTANCES = 125
+SIL_RC_WARMUP_STARTS = 16
+SIL_RC_WARMUP_INSTANCES_PER_EPOCH = SIL_RC_WARMUP_MICRO_INSTANCES * STEPS_PER_EPOCH  # 12,500
+SIL_RC_WARMUP_SAMPLES_PER_STEP = SIL_RC_WARMUP_MICRO_INSTANCES * SIL_RC_WARMUP_STARTS  # 2,000
 
 
 def check_step_math(

@@ -1,11 +1,14 @@
 # The step-matched comparison protocol
 
-The four CVRP training objectives -- POMO REINFORCE on generated instances, teacher forcing on
-HGS tours, LEHD partial reconstruction, and REINFORCE on LEHD partials -- are compared **per
-optimizer step**, not per dataset. Every arm decodes the same number of sequences per update,
-uses the same optimizer recipe, runs the same number of updates, and is scored on the same
-validation and test sets. Each arm nevertheless draws from its natural data source, so RL keeps
-its label-free, unlimited-sample advantage and SL/LEHD keep their labeled-data regime.
+The five CVRP training objectives -- POMO REINFORCE on generated instances, teacher forcing on
+HGS tours, LEHD partial reconstruction, REINFORCE on LEHD partials, and local-reconstruction
+self-improvement (SIL-RC) -- are compared **per optimizer step**, not per dataset. Every arm
+decodes the same number of sequences per update, uses the same optimizer recipe, runs the same
+number of updates, and is scored on the same validation and test sets. Each arm nevertheless
+draws from its natural data source, so RL keeps its label-free, unlimited-sample advantage and
+SL/LEHD keep their labeled-data regime. SIL-RC is the second label-free arm; it spends its first
+50 epochs on the paper's RL warm-up and its remaining 150 on teacher forcing against labels it
+improves itself.
 
 ## The step budget
 
@@ -30,10 +33,27 @@ rollout, a teacher-forced full trajectory, a LEHD partial, or a sampled partial 
 | LEHD-SL | HGS file | 125 labeled instances x 16 partials = 2,000 rows | `POMO_sl_lehd_step.py` |
 | LEHD-RL teacher | HGS file | 125 x 16 partials x K=1 = 2,000 rollouts | `POMO_rl_lehd_step.py --baseline teacher` |
 | LEHD-RL shared | HGS file | 125 x 4 partials x K=4 = 2,000 rollouts | `POMO_rl_lehd_step.py --baseline shared` |
+| SIL-RC | generator, 12,500 fixed per cycle | 125 instances x 16 partials = 2,000 rows | `POMO_sil_rc_step.py` |
+| LEHD-backbone SIL-RC | generator, 12,500 fixed per cycle | 125 instances x 16 partials = 2,000 rows | `LEHD_sil_rc_step.py` |
 
 The shared arm's 2,000 rollouts are **500 independent partials x 4 correlated samples**, not
 2,000 independent samples; each partial's advantages sum to zero under the shared baseline.
 The natural shared arm (16 partials x K=4 = 8,000 rollouts) is a 4x-cost secondary experiment.
+
+SIL-RC has a two-phase budget: the first 50 epochs (5,000 steps) are POMO REINFORCE on
+generated CVRP20 with 125 instances x 16 starts per step, and the remaining 150 epochs
+(15,000 steps) are the supervised phase. The supervised phase is five 30-epoch label cycles;
+each cycle regenerates 12,500 CVRP100 instances, improves their labels with 100 RRC rounds per
+instance, then trains on 12,500 x 16 = 200,000 partial windows per epoch. Label repair is extra
+compute outside the decoded-sequence count, comparable to the HGS solver's label acquisition for
+the SL arms.
+
+LEHD-backbone SIL-RC is the same budget with the reference LEHD light encoder / heavy decoder.
+The effective step stays 2,000; the micro-batch falls to 125 x 16 (the six-layer decoder
+re-encodes at every step, so the split, not the effective size, is the memory knob), the repair
+batch is 125, and validation defaults to one start (the LEHD paper's greedy protocol) instead of
+`N`. The teacher-forced loss is the reference's exact 2N CE; the rollout/RRC path uses the
+repo's N+1 action space. See [LEHD_SIL_RC.md](LEHD_SIL_RC.md).
 
 ## The shared optimizer recipe
 
@@ -52,6 +72,10 @@ the largest value that fits and gradient accumulation for the rest:
 | SL / LEHD-SL / LEHD-RL teacher | 500 x 4 (or 1,000 x 2) | 2,000 rows |
 | RL full-tour | 125 instances x 1 (fallback 25 x 5) | 2,000 rollouts |
 | LEHD-RL shared | 500 partials x 1 (or 250 x 2) | 2,000 rollouts |
+| SIL-RC SIL phase | 500 partials x 4 | 2,000 partials |
+| SIL-RC warm-up | 125 instances x 1 | 2,000 rollouts |
+| LEHD-backbone SIL-RC SIL phase | 125 partials x 16 | 2,000 partials |
+| LEHD-backbone SIL-RC warm-up | 125 instances x 1 | 2,000 rollouts |
 
 2,000 rows in one full-tour forward is ~41 GiB at N=100 and is deliberately avoided. LEHD's
 `w` is constant per optimizer-step chunk, so a chunk near `w=100` costs the same as a full-tour
@@ -70,6 +94,10 @@ dataset sizes are:
 | SL | 200,000 trajectories (12,500 x 16) |
 | LEHD-SL / teacher | 200,000 partials (12,500 x 16) |
 | LEHD-RL shared | 50,000 partials (12,500 x 4) |
+| SIL-RC SIL phase | 200,000 partials (12,500 x 16); labels regenerated per 30-epoch cycle |
+| SIL-RC warm-up | 12,500 generated CVRP20 instances (125 x 16 starts) |
+| LEHD-backbone SIL-RC SIL phase | 200,000 partials (12,500 x 16); labels regenerated per 30-epoch cycle |
+| LEHD-backbone SIL-RC warm-up | 12,500 generated CVRP20 instances (125 x 16 starts) |
 
 Validation and checkpointing therefore land on the same optimizer step for every arm. The
 epoch *content* remains method-specific; only the update count and cadence are synced.
@@ -87,6 +115,12 @@ remaining identical across arms. Evaluate all five test files with `num_augment=
 LABEL=PATH` labels to avoid the duplicate-label discovery collision, and `--select best` to
 pin the same checkpoint-selection rule for every arm.
 
+The LEHD-backbone arm defaults to `num_starts=1` (8 augmentations x 1 start) because POMO's
+`N`-start rollout is `N` times the sequences and the heavy decoder re-encodes at every step.
+`val/reward_greedy` is the same unaugmented greedy rollout in both arms; the paper-comparable
+number is the greedy + RRC evaluation. `--num-starts N` with a small batch restores the POMO
+protocol if needed.
+
 ## Seeding
 
 Every entry point calls `seed_everything(SEED, workers=True)` before env/model construction and
@@ -94,6 +128,14 @@ passes `seed=SEED` to the env. `CVRPEnv` forwards the seed to rl4co's env base, 
 draws a random seed and unseeds model init. Generated RL uses a dedicated `seed + epoch`
 generator for both instances and start nodes, and resume re-anchors `env._epoch`; file-backed
 draws use per-item NumPy RNGs and `shuffle=False`, so they are worker-count independent.
+
+SIL-RC keys its generated instance sets by `[LABEL_SEED, block]` and `LABEL_SEED + cycle`, its
+repair windows by `[seed, iteration, global_label_index]`, and its training windows by
+`[seed + epoch, label_index, window_index]`. The label sidecar is loaded on resume rather than
+redrawn; it also records the backbone and policy signature, so a POMO-initialised sidecar is
+refused by the LEHD-backbone arm (legacy sidecars count as POMO). The full contract is in
+[SIL_RC.md](SIL_RC.md#seeding-and-reproducibility) and
+[LEHD_SIL_RC.md](LEHD_SIL_RC.md#seeding-and-reproducibility).
 
 ## What is deliberately not equalized
 
@@ -105,6 +147,13 @@ draws use per-item NumPy RNGs and `shuffle=False`, so they are worker-count inde
 - **Distinct-instance composition.** The canonical one-partial-per-instance LEHD draw covers
   2,000 distinct instances per step; the headline arm uses 16 partials per instance to match
   the 125-instance geometry. The canonical draw is kept only as a labelled reference.
+- **SIL-RC method overhead.** Five label cycles x 12,500 instances x 100 RRC rounds, plus the
+  5,000-step CVRP20 warm-up. Its training steps decode the same 2,000 partials as the LEHD
+  arms, but the pseudo-label generation is compute the other arms do not pay per cycle.
+- **LEHD-backbone SIL-RC compute.** The heavy decoder re-runs six self-attention layers at
+  every decode step, so the same 2,000 sequences cost substantially more wall-clock than the
+  POMO arm, and its validation monitors one start rather than `N`. The decoded-sequence and
+  optimizer-step counts are still the comparable unit; FLOPs and validation rollouts are not.
 
 Those differences are the methods' characteristics. Report them alongside the step curves;
 do not compare a 20,000-step arm's best checkpoint to a 78,000-step artifact's best without

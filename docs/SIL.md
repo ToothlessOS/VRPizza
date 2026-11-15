@@ -10,6 +10,9 @@ Neural Combinatorial Optimization: Sample Without Replacement, but Improvement*)
 ported here are `core/stochastic_beam_search.py`, the WOR path of `core/incremental_sbs.py`,
 and the generate-then-teach loop of `cvrp_main.py`.
 
+The second SIL method -- pseudo-labels improved by LEHD-style local reconstruction, with an
+RL warm-up -- is documented separately in [SIL_RC.md](SIL_RC.md).
+
 ## Why this exists
 
 The repository trains CVRP100 three ways: POMO REINFORCE on generated instances (`rl-`),
