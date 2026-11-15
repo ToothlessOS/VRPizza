@@ -195,6 +195,7 @@ only as a comment in `train.py`, not in the paper's table.
 | `notebooks/POMO_sil_rc_step.py` | step-matched schedule |
 | `scripts/verify_sil_rc.py` | executable invariants |
 | `scripts/submit_sil_rc.sh` | both arms, one GPU each |
+| `scripts/submit_strict_sil_rc.sh` | strict POMO and strict LEHD, one GPU each |
 
 Reused unchanged:
 
@@ -305,6 +306,9 @@ DataLoader worker count.
 
 # Full arms, one GPU each
 sbatch scripts/submit_sil_rc.sh
+
+# The strict POMO and strict LEHD backbones side by side
+sbatch scripts/submit_strict_sil_rc.sh
 
 # Strict arm on a smaller first run
 .venv/bin/python notebooks/POMO_sil_rc.py --labels 100000

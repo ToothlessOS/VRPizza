@@ -218,6 +218,9 @@ the strict schedule is needed.
 # Full arms, one GPU each
 sbatch scripts/submit_lehd_sil_rc.sh
 
+# Both strict backbones side by side (POMO on GPU 0, LEHD on GPU 1)
+sbatch scripts/submit_strict_sil_rc.sh
+
 # A cheaper first strict run
 .venv/bin/python notebooks/LEHD_sil_rc.py --labels 100000
 
@@ -272,7 +275,8 @@ New:
   adapter and the faithful 2N helpers.
 * `src/models/sil_rc_lehd.py` — `SILRCLEHDLitModule` and the exact CE.
 * `notebooks/LEHD_sil_rc.py`, `notebooks/LEHD_sil_rc_step.py`.
-* `scripts/verify_lehd_sil_rc.py`, `scripts/submit_lehd_sil_rc.sh`.
+* `scripts/verify_lehd_sil_rc.py`, `scripts/submit_lehd_sil_rc.sh`, and
+  `scripts/submit_strict_sil_rc.sh` (strict POMO + strict LEHD side by side).
 
 Modified:
 
