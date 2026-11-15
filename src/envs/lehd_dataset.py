@@ -36,13 +36,13 @@ from torch.utils.data import Dataset
 
 from src.envs.dataset import build_index
 from src.envs.parser import resolve_data_path
-from src.envs.synced_dataset import _TaggedFileReader
+from src.envs.tagged_reader import TaggedFileReader
 from src.lehd.subpath import sample_window, split_routes
 
 __all__ = ["LEHDPartialDataset", "collate_partials"]
 
 
-class LEHDPartialDataset(_TaggedFileReader, Dataset):
+class LEHDPartialDataset(TaggedFileReader, Dataset):
     """One LEHD partial solution per instance per epoch.
 
     Args:

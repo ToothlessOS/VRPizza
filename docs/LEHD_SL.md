@@ -152,6 +152,7 @@ run the smoke and a short pilot first.
 .venv/bin/python notebooks/eval_rrc.py --datasets vrp100_test_lkh             # main run
 .venv/bin/python notebooks/eval_rrc.py --num-augment 1 --num-starts 1         # no multipliers
 .venv/bin/python notebooks/eval_rrc.py --rrc-init greedy                      # LEHD protocol
+.venv/bin/python notebooks/eval_rrc.py --checkpoint-dir checkpoints_rl_sil_100 # custom checkpoints
 .venv/bin/python notebooks/eval_rrc.py --report-from logs/eval_rrc/results.npz
 ```
 
@@ -187,7 +188,7 @@ matched model evaluations.
 .venv/bin/python scripts/verify_lehd_data.py   # geometry, draw, workers, teacher forcing
 .venv/bin/python scripts/verify_rrc.py         # rollout/replay, monotonicity, extremes, parity
 .venv/bin/python scripts/verify_sl_data.py     # unchanged pipeline still passes
-.venv/bin/python scripts/verify_synced_data.py
+.venv/bin/python scripts/verify_comparison.py
 .venv/bin/python scripts/verify_val_parity.py
 ```
 

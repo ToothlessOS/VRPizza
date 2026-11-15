@@ -92,8 +92,12 @@ class RRCResult:
             coordinate units.
         budget_costs: ``[B, len(budgets)]`` incumbent cost after each budget.
         stats: Acceptance and compute counters.
+        final_routes: The incumbent route lists after the largest budget. Populated by both
+            entry points; cost-only callers may ignore it. Used by the SIL local-reconstruction
+            label generator, which writes the improved tours back into its store.
     """
 
     initial_cost: np.ndarray
     budget_costs: np.ndarray
     stats: RRCStats = field(default_factory=RRCStats)
+    final_routes: list[list[np.ndarray]] | None = None

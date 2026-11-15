@@ -53,9 +53,11 @@ class SILSearchConfig:
         top_p: Nucleus truncation. Disabled at 1.0.
         min_nucleus_top_p: Starting top-p for the linear anneal across WOR rounds.
         perform_first_round_deterministic: Make WOR round 0 a plain beam search.
-        chunk_size: Instances per encoded chunk. Also bounds the decoder batch:
-            ``chunk_size * beam_width`` cache rows are materialised per level, so keep this
-            small (16-32 at ``N=100``).
+        chunk_size: Instances per encoded chunk. The encoder cache is per instance and is
+            broadcast across the level's beam, so this no longer multiplies the decoder's cache
+            footprint. It bounds the residual-memory cost of the WOR trie (roughly
+            ``chunk_size * beam_width * depth`` nodes), which is why 32 is still the practical
+            value; larger chunks measured no faster.
         temperature: Decoding temperature.
         tanh_clipping: Logit clipping. ``None`` uses the policy's own value.
         seed: Seed for instance generation and the Gumbel draws.

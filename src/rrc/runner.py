@@ -49,6 +49,7 @@ __all__ = [
     "cost_from_flags_torch",
     "greedy_rollout",
     "run_rrc",
+    "run_rrc_from_routes",
 ]
 
 
@@ -219,10 +220,6 @@ def run_rrc(
     if positions.size != size:
         raise ValueError(f"positions has {positions.size} entries for a batch of {size}")
 
-    w_max = n_loc if config.w_max is None else min(int(config.w_max), n_loc)
-    if config.w_min > w_max:
-        raise ValueError(f"w_min={config.w_min} exceeds the usable maximum {w_max}")
-
     # -- initial incumbent and matched plain baseline ---------------------------------
     if config.init == "multistart":
         reward, actions = best_multistart(
@@ -251,6 +248,72 @@ def run_rrc(
     budget_costs = np.full((size, len(budgets)), np.nan, dtype=np.float64)
     budget_index = {budget: index for index, budget in enumerate(budgets)}
     stats = RRCStats()
+
+    routes, _, budget_costs, stats = _rrc_loop(
+        model,
+        env,
+        batch,
+        routes,
+        costs,
+        config,
+        positions,
+        n_loc,
+        size,
+        budget_costs,
+        budget_index,
+        stats,
+    )
+
+    stats.seconds = time.time() - started
+    return RRCResult(
+        initial_cost=initial_cost,
+        budget_costs=budget_costs,
+        stats=stats,
+        final_routes=routes,
+    )
+
+
+def _rrc_loop(
+    model,
+    env,
+    batch: TensorDict,
+    routes: list[list[np.ndarray]],
+    costs: torch.Tensor,
+    config: RRCConfig,
+    positions: np.ndarray,
+    n_loc: int,
+    size: int,
+    budget_costs: np.ndarray,
+    budget_index: dict[int, int],
+    stats: RRCStats,
+) -> tuple[list[list[np.ndarray]], torch.Tensor, np.ndarray, RRCStats]:
+    """Run the shared reconstruction iterations from a given incumbent.
+
+    The loop is the one :func:`run_rrc` has always used; it is factored out so the SIL label
+    generator can start from a supplied complete solution instead of a model rollout. Every
+    draw is keyed by the global instance position, which is what makes the instance's windows
+    independent of how the caller chunks the batch.
+
+    Args:
+        model: A fitted POMO-family module with a ``policy``.
+        env: An environment providing ``reset_partial``.
+        batch: Complete instances with ``depot``, ``locs``, raw ``demand`` and ``capacity``.
+        routes: Initial incumbent route lists, one per instance.
+        costs: Initial exact full-tour costs, ``[B]`` float64 on the batch device.
+        config: Budgets, window range, seed and augmentation count.
+        positions: Global instance positions used to seed the per-instance draws.
+        n_loc: Customers per instance.
+        size: Batch size.
+        budget_costs: Output buffer, ``[B, len(budgets)]``.
+        budget_index: Map from budget value to its column in ``budget_costs``.
+        stats: Counters updated in place.
+
+    Returns:
+        ``(routes, costs, budget_costs, stats)`` after the largest budget.
+    """
+    w_max = n_loc if config.w_max is None else min(int(config.w_max), n_loc)
+    if config.w_min > w_max:
+        raise ValueError(f"w_min={config.w_min} exceeds the usable maximum {w_max}")
 
     # Geometry is CPU-side; the tensors are moved once per chunk.
     locs_cpu = batch["locs"].detach().cpu().numpy()
@@ -387,5 +450,99 @@ def run_rrc(
                 costs.detach().cpu().numpy().astype(np.float64)
             )
 
+    return routes, costs, budget_costs, stats
+
+
+@torch.no_grad()
+def run_rrc_from_routes(
+    model,
+    env,
+    batch: TensorDict,
+    routes: list[list[np.ndarray]],
+    config: RRCConfig,
+    positions: np.ndarray | None = None,
+) -> RRCResult:
+    """Improve supplied complete solutions with the same RRC loop.
+
+    This is the label-generation entry point for SIL: the caller already has a feasible
+    incumbent per instance (random insertion, a model rollout, or the previous cycle's labels),
+    so there is no initial rollout to run. The returned ``final_routes`` are what the caller
+    writes back as the improved labels.
+
+    Args:
+        model: A fitted POMO-family module with a ``policy``.
+        env: An environment providing ``reset_partial``.
+        batch: Complete instances with ``depot``, ``locs``, raw ``demand`` and ``capacity``.
+        routes: One route list per instance; each must cover exactly ``1..n_loc``.
+        config: Budgets, window range, seed and augmentation count. ``init`` is unused.
+        positions: Global instance positions used to seed the per-instance draws. Pass the
+            global label indices, not chunk-local rows, so chunking cannot change the draw.
+
+    Returns:
+        :class:`~src.rrc.config.RRCResult` with the exact initial and per-budget costs and the
+        improved route lists in ``final_routes``.
+
+    Raises:
+        ValueError: If the batch and routes disagree, or a route list does not cover ``1..n``.
+    """
+    started = time.time()
+    size = int(batch.batch_size[0])
+    n_loc = int(batch["locs"].shape[1])
+    if positions is None:
+        positions = np.arange(size, dtype=np.int64)
+    positions = np.asarray(positions, dtype=np.int64)
+    if positions.size != size:
+        raise ValueError(f"positions has {positions.size} entries for a batch of {size}")
+    if len(routes) != size:
+        raise ValueError(f"got {len(routes)} route lists for a batch of {size}")
+
+    flats = []
+    for row, route_list in enumerate(routes):
+        customers, flags = flatten_routes(route_list)
+        if customers.size != n_loc or not np.array_equal(
+            np.sort(customers), np.arange(1, n_loc + 1, dtype=np.int64)
+        ):
+            raise ValueError(
+                f"route list {row} does not cover every customer exactly once "
+                f"(got {customers.size} customers for n_loc={n_loc})"
+            )
+        flats.append((customers, flags))
+
+    customers_t = torch.as_tensor(
+        np.stack([flat[0] for flat in flats]), device=batch.device
+    )
+    flags_t = torch.as_tensor(
+        np.stack([flat[1] for flat in flats]), device=batch.device
+    ).bool()
+    costs = cost_from_flags_torch(customers_t, flags_t, batch["depot"], batch["locs"])
+    if not bool(torch.isfinite(costs).all()):
+        raise ValueError("the supplied routes produced a non-finite full-tour cost")
+    initial_cost = costs.detach().cpu().numpy().copy()
+
+    budgets = config.budgets
+    budget_costs = np.full((size, len(budgets)), np.nan, dtype=np.float64)
+    budget_index = {budget: index for index, budget in enumerate(budgets)}
+    stats = RRCStats()
+
+    routes, _, budget_costs, stats = _rrc_loop(
+        model,
+        env,
+        batch,
+        [list(route_list) for route_list in routes],
+        costs,
+        config,
+        positions,
+        n_loc,
+        size,
+        budget_costs,
+        budget_index,
+        stats,
+    )
+
     stats.seconds = time.time() - started
-    return RRCResult(initial_cost=initial_cost, budget_costs=budget_costs, stats=stats)
+    return RRCResult(
+        initial_cost=initial_cost,
+        budget_costs=budget_costs,
+        stats=stats,
+        final_routes=routes,
+    )

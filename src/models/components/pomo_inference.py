@@ -94,6 +94,10 @@ class POMOInferenceMixin:
             td = augment(td)
 
         if num_starts is None:
+            # A model may pin a cheaper default (the LEHD heavy decoder cannot
+            # afford the N-start rollout); the explicit argument still wins.
+            num_starts = getattr(self, "inference_num_starts", None)
+        if num_starts is None:
             num_starts = self.env.get_num_starts(td)
         else:
             num_starts = int(num_starts)

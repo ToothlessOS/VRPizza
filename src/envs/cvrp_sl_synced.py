@@ -1,23 +1,21 @@
-"""Supervised CVRP drawing from the shared, instance-grouped epoch used by the synced RL env.
+"""Supervised CVRP drawing an instance-grouped, 16-start epoch.
 
 The difference from :class:`~src.envs.CVRPEnv` is the shape of one epoch. ``CVRPEnv`` samples
 ``size`` *slots* uniformly from the whole ``sum(2R)`` pool, so an epoch touches ~95,300
 instances at ~1.05 starts each and an instance's other optimal starts are never seen
-together. This environment samples *instances* and expands each into all ``k`` of its drawn
+together. This environment samples *instances* and expands each into ``k`` of its drawn
 starts, which is the draw :class:`~src.envs.dataset.CVRPSolutionDataset` documents but does
-not implement -- and, more to the point here, the same draw
-:class:`~src.envs.SyncedRLCVRPEnv` trains on.
+not implement -- and the draw the step-matched SL arm uses (125 instances x 16 starts =
+2,000 supervised rows per optimizer step).
 
 Validation and testing are untouched: they fall through to
-:class:`~src.envs.CVRPEnv`, so the two pipelines are still scored on the identical held-out
-subset.
+:class:`~src.envs.CVRPEnv`, so the model is still scored on the identical held-out subset.
 
 The one thing a caller has to get right is batching. Rows are indexed instance-major, so an
 instance's ``k`` trajectories are contiguous, and the dataloader must **not** shuffle at row
 level -- otherwise a step covers ~``batch_size`` distinct instances instead of
-``batch_size / k``, and the grouping stops matching the RL side. Randomisation comes from the
-draw itself, which reorders the instances every epoch. Pass
-``shuffle_train_dataloader=False`` to the Lightning module.
+``batch_size / k``. Randomisation comes from the draw itself, which reorders the instances
+every epoch. Pass ``shuffle_train_dataloader=False`` to the Lightning module.
 """
 
 from __future__ import annotations
@@ -42,7 +40,7 @@ class SyncedCVRPEnv(CVRPEnv):
         capacity: Vehicle capacity in the file's own demand units. Inferred when omitted.
         val_instances: Held-out instances carved from the tail of ``data_path``.
         seed: Base seed for the draw. Training re-draws with ``seed + epoch``, the same
-            scheme :class:`~src.envs.CVRPEnv` and :class:`~src.envs.SyncedRLCVRPEnv` use.
+            scheme :class:`~src.envs.CVRPEnv` uses.
         check_solution: Forwarded to :class:`~src.envs.CVRPEnv`.
         starts_per_instance: Trajectories contributed per instance. Must not exceed the
             smallest ``2R`` in the training range.

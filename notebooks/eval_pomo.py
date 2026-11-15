@@ -44,6 +44,7 @@ run over a subset:
     .venv/bin/python notebooks/eval_pomo.py --limit 8      # smoke test, seconds
     .venv/bin/python notebooks/eval_pomo.py                # full run, ~65 min measured
     .venv/bin/python notebooks/eval_pomo.py --limit 32 --mcts --mcts-sims-per-root 32
+    .venv/bin/python notebooks/eval_pomo.py --checkpoint-dir checkpoints_rl_sil_100
     .venv/bin/python notebooks/eval_pomo.py --report-from logs/eval_pomo_cvrp/results.npz
 
 or, equivalently, ``uv run notebooks/eval_pomo.py``. Paths are resolved against the repository
@@ -76,7 +77,14 @@ from tensordict.tensordict import TensorDict
 
 from src.envs import EvalCVRPEnv, InstanceSet, load_instances, project_root
 from src.mcts import POMOMCTSConfig, SearchStatistics, solve_batch_with_pomo_mcts
-from src.models import LEHDPOMORL, LEHDPOMOSL, POMORL, POMOSIL, POMOSL
+from src.models import (
+    LEHDPOMORL,
+    LEHDPOMOSL,
+    POMORL,
+    POMOSIL,
+    POMOSL,
+    SILRCLEHDLitModule,
+)
 
 # --------------------------------------------------------------------------------------
 # Configuration
@@ -106,6 +114,16 @@ MODEL_CLASSES = {
     # Self-improvement learning: the same policy network, trained by an RL warm-up followed by
     # teacher forcing on self-generated pseudo-experts.
     "sil": POMOSIL,
+    # Local-reconstruction SIL. Same policy graph as every POMO run; only the training loop
+    # differs, so POMORL (weights + shared inference) is the right loader. The longest-prefix
+    # match keeps it distinct from "sil".
+    "sil_rc": POMORL,
+    # LEHD backbone, same SIL-RC pipeline. The two run labels are separate because
+    # `discover_checkpoints` keys on the text before the first "-", and the strict and
+    # step-matched arms live under different roots but must not collide if both are
+    # listed explicitly.
+    "lehd_sil_rc": SILRCLEHDLitModule,
+    "lehd_sil_rc_step": SILRCLEHDLitModule,
 }
 
 #: Suffix a result label carries when the search produced it.
@@ -209,29 +227,226 @@ def batch_size_for(num_loc: int) -> int:
     return int(max(1, min(256, round(scaled))))
 
 
-def discover_checkpoints() -> dict[str, Path]:
-    """Find the ``last.ckpt`` of every training run under ``checkpoints/``.
+def model_class_for(label: str):
+    """Resolve a run label to the Lightning module that loads it.
+
+    Labels arrive from two places: the prefix of a run directory, which is always an exact key
+    of :data:`MODEL_CLASSES`, and ``--checkpoint LABEL=PATH``, which exists so two runs of the
+    same family can be evaluated together -- ``sil_w10`` beside ``sil_w50``, say -- and
+    therefore carries a suffix the prefix does not. Longest-prefix matching resolves both.
+
+    Longest matters: ``lehd_rl_shared`` starts with ``lehd_rl`` and ``lehd``, and only the
+    longest match is the module the weights were trained with (the shared-baseline arm has a
+    different training step, so loading it as the teacher arm would silently score a partly
+    wrong graph).
+
+    Args:
+        label: A label from :func:`discover_checkpoints` or from ``--checkpoint``.
+
+    Returns:
+        The Lightning module class.
+
+    Raises:
+        ValueError: If no registered prefix matches, since the label is what decides which
+            module the weights are loaded into.
+    """
+    matches = [
+        registered
+        for registered in MODEL_CLASSES
+        if label == registered
+        or label.startswith(f"{registered}-")
+        or label.startswith(f"{registered}_")
+    ]
+    if not matches:
+        raise ValueError(
+            f"{label!r} does not start with one of {sorted(MODEL_CLASSES)}; add its prefix "
+            "to MODEL_CLASSES or choose a label that does"
+        )
+    return MODEL_CLASSES[max(matches, key=len)]
+
+
+def resolve_path(path: str | Path) -> Path:
+    """Resolve a user-supplied path against the repository root when it is relative.
+
+    Args:
+        path: An absolute path, or one relative to the repository root.
+
+    Returns:
+        The absolute path.
+    """
+    path = Path(path).expanduser()
+    return path if path.is_absolute() else project_root() / path
+
+
+def discover_checkpoints(roots: list[Path] | None = None) -> dict[str, Path]:
+    """Find the ``last.ckpt`` of every training run under the given roots.
+
+    Each root may be a directory of runs (globbed as ``*/last.ckpt``), a single run directory
+    holding ``last.ckpt``, or a ``.ckpt`` file itself, so ``--checkpoint-dir`` accepts the path
+    a user is most likely to have on hand. A *directory* scan only ever picks up ``last.ckpt``,
+    as before; an ``epoch_*.ckpt`` has to be named directly through ``--checkpoint`` (or given
+    as the root itself).
+
+    Args:
+        roots: Directories to scan. ``None`` means ``checkpoints/`` in the repository root.
 
     Returns:
         A dict mapping the run's label -- the prefix of its directory name, ``rl``, ``sl`` or
         ``lehd`` -- to the checkpoint path.
 
     Raises:
+        FileNotFoundError: If a root does not exist, or no checkpoint is found under any root.
         ValueError: If a run directory's prefix is not in :data:`MODEL_CLASSES`, since the
-            label decides which Lightning module the weights are loaded into.
+            label decides which Lightning module the weights are loaded into; or if two runs
+            map to the same label, which would otherwise silently drop one of them.
     """
+    if roots is None:
+        roots = [project_root() / "checkpoints"]
+
     found: dict[str, Path] = {}
-    for checkpoint in sorted((project_root() / "checkpoints").glob("*/last.ckpt")):
-        label = checkpoint.parent.name.split("-", 1)[0]
-        if label not in MODEL_CLASSES:
-            raise ValueError(
-                f"{checkpoint.parent.name} does not start with one of "
-                f"{sorted(MODEL_CLASSES)}; add its label to MODEL_CLASSES"
-            )
-        found[label] = checkpoint
+    for root in roots:
+        root = Path(root)
+        if not root.exists():
+            raise FileNotFoundError(f"no such checkpoint path: {root}")
+        if root.is_file():
+            runs = [root]
+        elif (root / "last.ckpt").is_file():
+            runs = [root / "last.ckpt"]
+        else:
+            runs = sorted(root.glob("*/last.ckpt"))
+
+        for checkpoint in runs:
+            label = checkpoint.parent.name.split("-", 1)[0]
+            if label not in MODEL_CLASSES:
+                raise ValueError(
+                    f"{checkpoint.parent.name} does not start with one of "
+                    f"{sorted(MODEL_CLASSES)}; add its label to MODEL_CLASSES"
+                )
+            if label in found:
+                # The label is the model class, not the run's identity, so two runs of one
+                # family collide by construction. Overwriting would evaluate one of them and
+                # report it under the other's name, which is worse than refusing.
+                raise ValueError(
+                    f"two runs map to the label {label!r}: {found[label].parent.name} and "
+                    f"{checkpoint.parent.name}. Evaluate them under distinct labels with "
+                    f"--checkpoint {label}_<suffix>=<path> (the label must start with "
+                    f"{label!r}, which selects the Lightning module), or scan a directory "
+                    "holding one of them"
+                )
+            found[label] = checkpoint
+
     if not found:
-        raise FileNotFoundError("no checkpoints/*/last.ckpt found")
+        raise FileNotFoundError(
+            f"no last.ckpt found under {', '.join(str(root) for root in roots)}"
+        )
     return found
+
+
+def parse_checkpoint_spec(spec: str) -> tuple[str, Path]:
+    """Parse a ``--checkpoint`` argument into ``(label, path)``.
+
+    ``LABEL=PATH`` names the run explicitly, which is how two runs of the same family -- both
+    whose directory prefixes would map to ``sil`` -- can be evaluated side by side. A bare
+    ``PATH`` derives the label from the run directory's prefix instead.
+
+    Args:
+        spec: ``"sil_w10=path/to/last.ckpt"`` or ``"path/to/last.ckpt"``.
+
+    Returns:
+        The label and the resolved checkpoint path.
+
+    Raises:
+        FileNotFoundError: If the path is not a file.
+        ValueError: If the label does not start with a registered prefix.
+    """
+    label, separator, path = spec.partition("=")
+    if not separator:
+        label, path = "", spec
+    checkpoint = resolve_path(path)
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"no such checkpoint file: {checkpoint}")
+    if not label:
+        label = checkpoint.parent.name.split("-", 1)[0]
+    model_class_for(label)  # validates the prefix and raises the list of registered ones
+    return label, checkpoint
+
+
+def best_checkpoint(checkpoint: Path) -> Path:
+    """Resolve a run's best ``val/reward`` checkpoint from its ``last.ckpt``.
+
+    Lightning stores the ``ModelCheckpoint`` state under a dynamic key such as
+    ``ModelCheckpoint{'monitor': 'val/reward', ...}``, so the key is found by prefix. The stored
+    ``best_model_path`` is absolute on the training host; only its basename is portable, and it
+    is re-rooted beside the checkpoint being read.
+    """
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    callbacks = state.get("callbacks", {})
+    for key, value in callbacks.items():
+        if not key.startswith("ModelCheckpoint"):
+            continue
+        best = value.get("best_model_path")
+        if not best:
+            continue
+        candidate = checkpoint.parent / Path(best).name
+        if not candidate.is_file():
+            raise FileNotFoundError(
+                f"{checkpoint.parent.name}: best checkpoint {Path(best).name} is not beside "
+                f"{checkpoint.name}; copy it from the training host or pass it explicitly"
+            )
+        return candidate
+    raise ValueError(f"{checkpoint} carries no ModelCheckpoint best_model_path")
+
+
+def select_checkpoints(
+    checkpoint_dirs: list[str] | None,
+    checkpoint_specs: list[str] | None,
+    select: str = "last",
+) -> dict[str, Path]:
+    """Resolve the checkpoint set from the two mutually exclusive selection flags.
+
+    Shared with ``notebooks/eval_rrc.py`` so a custom checkpoint resolves identically in both
+    drivers -- the label decides the Lightning module, so the two must not grow their own
+    interpretations of it.
+
+    Args:
+        checkpoint_dirs: The ``--checkpoint-dir`` values, if any.
+        checkpoint_specs: The ``--checkpoint`` values (``LABEL=PATH`` or a bare path), if any.
+        select: ``"last"`` keeps the resolved checkpoints; ``"best"`` replaces each with the
+            run's best ``val/reward`` checkpoint, resolved by :func:`best_checkpoint`.
+
+    Returns:
+        Label to checkpoint path.
+
+    Raises:
+        SystemExit: If a scan and an explicit set are both given, or if two explicit entries
+            share a label. The first is refused because a scan and a named run could both
+            claim the same label and silently preferring one would evaluate the wrong
+            checkpoint under a plausible name.
+    """
+    if checkpoint_specs and checkpoint_dirs:
+        raise SystemExit(
+            "--checkpoint and --checkpoint-dir are alternatives: name every checkpoint with "
+            "--checkpoint when you also need custom labels, or scan a directory without them"
+        )
+    if checkpoint_specs:
+        selected: dict[str, Path] = {}
+        for spec in checkpoint_specs:
+            label, checkpoint = parse_checkpoint_spec(spec)
+            if label in selected:
+                raise SystemExit(
+                    f"--checkpoint gives the label {label!r} twice "
+                    f"({selected[label]}, {checkpoint}); labels must be unique"
+                )
+            selected[label] = checkpoint
+    else:
+        roots = [resolve_path(root) for root in checkpoint_dirs] if checkpoint_dirs else None
+        selected = discover_checkpoints(roots)
+
+    if select == "best":
+        selected = {label: best_checkpoint(path) for label, path in selected.items()}
+    elif select != "last":
+        raise SystemExit(f"--select must be 'last' or 'best', got {select!r}")
+    return selected
 
 
 def natural_key(name: str) -> tuple:
@@ -474,11 +689,12 @@ def load_model(
     """Build a checkpoint's model and load its weights.
 
     Args:
-        label: The run's label, indexing :data:`MODEL_CLASSES`.
+        label: The run's label, resolved to a module by :func:`model_class_for`.
         checkpoint: Path to the ``.ckpt``.
-        env: The environment to attach. Only its ``name`` matters at construction -- the
-            network is built from the environment's name plus rl4co's POMO defaults, which
-            both training scripts used -- but it is attached so the mixin finds it and is
+        env: The environment to attach. The module class decides the network --
+            the POMO-family classes build rl4co's POMO policy from the
+            environment's name, while ``SILRCLEHDLitModule`` builds the LEHD
+            encoder/decoder -- but it is attached so the mixin finds it and is
             replaced per customer count as evaluation proceeds.
         device: Torch device.
         num_augment: Dihedral augmentations to validate with. Must match what the model counts
@@ -488,7 +704,7 @@ def load_model(
     Returns:
         The fitted model, in eval mode.
     """
-    model = MODEL_CLASSES[label](env, num_augment=num_augment, eval_greedy=False)
+    model = model_class_for(label)(env, num_augment=num_augment, eval_greedy=False)
 
     # `weights_only=False` is required, not merely permissive: the RL checkpoint pickles its
     # training environment into `hyper_parameters`, and that object is a `RLCVRPEnv` holding
@@ -545,6 +761,18 @@ def evaluate(
         label to its cost accounting.
     """
     total = len(inst)
+    if search_cfg is not None:
+        unsupported = [
+            label
+            for label, model in models.items()
+            if isinstance(model, SILRCLEHDLitModule)
+        ]
+        if unsupported:
+            raise ValueError(
+                f"--mcts reaches into POMO's encoder/decoder cache and is not supported "
+                f"for the LEHD backbone ({', '.join(sorted(unsupported))}); evaluate it "
+                "with the plain rollout or notebooks/eval_rrc.py"
+            )
     labels = [
         method_label(label, searched)
         for label in models
@@ -860,6 +1088,29 @@ def main(argv: list[str] | None = None) -> int:
         "--datasets", nargs="*", default=None, help="file stems to evaluate (default: all)"
     )
     parser.add_argument("--checkpoints", nargs="*", default=None, help="labels, e.g. rl sl")
+    parser.add_argument(
+        "--checkpoint-dir",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help="directory of runs (or a run directory, or a .ckpt) to evaluate; repeatable, and "
+        "replaces the default checkpoints/ scan",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        action="append",
+        default=None,
+        metavar="LABEL=PATH",
+        help="an explicit checkpoint to evaluate under LABEL; repeatable. A bare PATH takes "
+        "its label from the run directory's prefix. Replaces the directory scan, which is "
+        "what lets two runs of one family be evaluated side by side",
+    )
+    parser.add_argument(
+        "--select",
+        choices=("last", "best"),
+        default="last",
+        help="evaluate the resolved last.ckpt or each run's best val/reward checkpoint",
+    )
     parser.add_argument("--limit", type=int, default=None, help="instances per dataset")
     parser.add_argument("--batch-size", type=int, default=None, help="override the per-N batch")
     parser.add_argument("--num-augment", type=int, default=NUM_AUGMENT)
@@ -910,7 +1161,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.report_from:
         return report(np.load(args.report_from))
 
-    checkpoints = discover_checkpoints()
+    checkpoints = select_checkpoints(args.checkpoint_dir, args.checkpoint, select=args.select)
     if args.checkpoints:
         unknown = [c for c in args.checkpoints if c not in checkpoints]
         if unknown:
@@ -918,7 +1169,10 @@ def main(argv: list[str] | None = None) -> int:
         checkpoints = {k: v for k, v in checkpoints.items() if k in args.checkpoints}
 
     datasets = discover_datasets(args.datasets)
-    print(f"checkpoints: {', '.join(f'{k} ({v.parent.name})' for k, v in checkpoints.items())}")
+    print(
+        "checkpoints: "
+        + ", ".join(f"{k} ({v.parent.name}/{v.name})" for k, v in checkpoints.items())
+    )
     print(f"datasets:    {', '.join(name for name, _ in datasets)}")
     starts_label = "N" if args.num_starts is None else str(args.num_starts)
     print(

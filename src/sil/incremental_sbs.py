@@ -19,6 +19,7 @@ beam search.
 
 from __future__ import annotations
 
+import math
 import sys
 import typing
 from typing import Callable, List, Optional, Tuple
@@ -43,10 +44,15 @@ def log_subtract(x: float, y: float) -> float:
     """Return ``log(exp(x) - exp(y))``, or ``-inf`` when ``x <= y``.
 
     Inspired by https://stackoverflow.com/questions/778047.
+
+    Scalar ``math`` rather than NumPy: this runs once per trie edge on every sampled leaf, and
+    the NumPy ufunc call overhead dominated it. The values are computed in double precision like
+    the NumPy expression (within 1 ulp of it) and land in a float32 mass array either way.
     """
-    with np.errstate(divide="ignore"):
-        result = x + np.log1p(-np.exp(np.minimum(y - x, 0)))
-    return result
+    delta = float(y) - float(x)
+    if delta >= 0.0:
+        return -np.inf
+    return float(x) + math.log1p(-math.exp(delta))
 
 
 def gumbel_log_survival(x: np.ndarray) -> np.ndarray:
@@ -124,6 +130,21 @@ class _TrieNode:
         advantage_touched_flag: Whether the node was already updated in the current round.
     """
 
+    # `__slots__` because a chunk's trie holds ~10^5-10^6 nodes and the plain class pays a dict
+    # per instance. `ancestors` is a cached property below, not a slot.
+    __slots__ = (
+        "parent",
+        "index_in_parent",
+        "children",
+        "unsampled_log_masses",
+        "children_advantages",
+        "children_visit_counts",
+        "sbs_child_state_cache",
+        "advantage_touched_flag",
+        "live_child_edges",
+        "_ancestors_cache",
+    )
+
     def __init__(self, parent: Optional["_TrieNode"], index_in_parent: Optional[int]) -> None:
         self.parent = parent
         self.index_in_parent = index_in_parent
@@ -132,8 +153,20 @@ class _TrieNode:
         self.children_advantages = None
         self.children_visit_counts = None
         self.sbs_child_state_cache: Optional[List[Tuple[sbs.State, bool]]] = None
-        self.ancestors = [] if parent is None else [parent] + parent.ancestors
         self.advantage_touched_flag = False
+        # Number of outgoing edges whose residual mass is not `-inf`, maintained by
+        # `mark_mass_sampled`; `None` until the node is first expanded.
+        self.live_child_edges: Optional[int] = None
+        self._ancestors_cache: Optional[List["_TrieNode"]] = None
+
+    @property
+    def ancestors(self) -> List["_TrieNode"]:
+        """Parent chain, nearest first. Built lazily: only the dormant theory update reads it."""
+        if self._ancestors_cache is None:
+            self._ancestors_cache = (
+                [] if self.parent is None else [self.parent] + self.parent.ancestors
+            )
+        return self._ancestors_cache
 
     def initial_log_mass_if_not_sampled(self) -> float:
         """Return this node's initial log mass, assuming no sample has been drawn from it."""
@@ -145,6 +178,16 @@ class _TrieNode:
         """Mark this node as a terminal leaf."""
         self.children = []
 
+    def init_masses(self, child_log_probs: np.ndarray, initial_log_mass: float) -> None:
+        """Install the initial residual masses of this node's outgoing edges.
+
+        Also seeds :attr:`live_child_edges`, which makes :meth:`exhausted` O(1). A NaN mass
+        counts as live, exactly as the previous ``all(np.isneginf(...))`` scan did.
+        """
+        masses = child_log_probs + initial_log_mass
+        self.unsampled_log_masses = masses
+        self.live_child_edges = int(masses.size - np.count_nonzero(np.isneginf(masses)))
+
     def exhausted(self) -> bool:
         """Return whether all probability mass at this node has been sampled."""
         # Distinguish [] (leaf) from None (never expanded).
@@ -152,25 +195,39 @@ class _TrieNode:
             return True
         if self.unsampled_log_masses is None:
             return False
-        return all(np.isneginf(self.unsampled_log_masses))
+        return self.live_child_edges == 0
 
     def mark_mass_sampled(self, log_mass: float) -> None:
-        """Recursively subtract ``log_mass`` from this node's edge and all ancestors' edges."""
-        if not self.parent:  # root
-            return
-        if self.exhausted():
-            new_log_mass = -np.inf  # Forbid ever sampling this edge again.
-        else:
-            new_log_mass = log_subtract(
-                self.parent.unsampled_log_masses[self.index_in_parent], log_mass
-            )
-        self.parent.unsampled_log_masses[self.index_in_parent] = new_log_mass
-        self.parent.mark_mass_sampled(log_mass)
+        """Subtract ``log_mass`` from this node's edge and all ancestors' edges."""
+        node = self
+        while node.parent is not None:
+            parent = node.parent
+            edge = node.index_in_parent
+            masses = parent.unsampled_log_masses
+            if node.exhausted():
+                new_log_mass = -np.inf  # Forbid ever sampling this edge again.
+            else:
+                new_log_mass = log_subtract(masses[edge], log_mass)
+            # Keep `live_child_edges` exact: decrement only when a finite edge becomes -inf.
+            # Comparing to -inf is equivalent to `np.isneginf` here and ~30x cheaper per edge.
+            if new_log_mass == -np.inf and masses[edge] != -np.inf:
+                parent.live_child_edges -= 1
+            masses[edge] = new_log_mass
+            node = parent
 
     def add_simple_advantage(self, mass: float) -> None:
         """Recursively add ``mass`` to this node's edge and all ancestors' edges."""
         if not self.parent:
             return
+        # A trie first driven by WOR does not allocate the advantage arrays; allocate on first
+        # use so an update-type switch on a reused searcher still works.
+        if self.parent.children_advantages is None:
+            self.parent.children_advantages = np.zeros(
+                len(self.parent.unsampled_log_masses)
+            )
+            self.parent.children_visit_counts = np.full(
+                len(self.parent.unsampled_log_masses), 1e-8
+            )
         self.parent.children_advantages[self.index_in_parent] += mass
         self.parent.children_visit_counts[self.index_in_parent] += 1
         self.parent.add_simple_advantage(mass)
@@ -201,6 +258,13 @@ class _TrieNode:
                 expectation_node = gumbel_without_replacement_expectation(
                     shared_node_leaves, leaf_eval_fn
                 )
+                if self.parent.children_advantages is None:
+                    self.parent.children_advantages = np.zeros(
+                        len(self.parent.unsampled_log_masses)
+                    )
+                    self.parent.children_visit_counts = np.full(
+                        len(self.parent.unsampled_log_masses), 1e-8
+                    )
                 self.parent.children_advantages[self.index_in_parent] += (
                     advantage_constant * (expectation_node - expectation_parent)
                 )
@@ -312,7 +376,12 @@ class IncrementalSBS:
 
             round_beam_leaves_batch = sbs.stochastic_beam_search(
                 child_log_probability_fn=self.wrap_child_log_probability_fn(
-                    self.child_log_probability_fn, normalize_advantage_by_visit_count
+                    self.child_log_probability_fn,
+                    normalize_advantage_by_visit_count,
+                    # WOR never reads the advantage/visit arrays; the gumbeldore and theory
+                    # updates do. Skipping two [A] allocations per expanded trie node is a
+                    # measurable share of the WOR arm.
+                    track_advantages=log_prob_update_type != "wor",
                 ),
                 child_transition_fn=self.wrap_child_transition_fn(
                     self.child_transition_fn, self.memory_aggressive
@@ -426,9 +495,15 @@ class IncrementalSBS:
 
     @staticmethod
     def wrap_child_log_probability_fn(
-        child_log_probability_fn, normalize_advantage_by_visit_count: bool
+        child_log_probability_fn,
+        normalize_advantage_by_visit_count: bool,
+        track_advantages: bool = True,
     ) -> Callable[[List[Tuple[_TrieNode, sbs.State]]], List[np.ndarray]]:
-        """Wrap a client callback so it reads and writes the trie's residual masses."""
+        """Wrap a client callback so it reads and writes the trie's residual masses.
+
+        ``track_advantages=False`` skips the per-node advantage/visit arrays. Only the WOR update
+        is valid with it, because the gumbeldore and theory updates accumulate into those arrays.
+        """
 
         def wrapper_child_log_probability_fn(
             node_state_tuples: List[Tuple[_TrieNode, sbs.State]],
@@ -436,39 +511,61 @@ class IncrementalSBS:
             results = [None] * len(node_state_tuples)
             unexpanded_client_states = []
             unexpanded_indices = []
+            cached_indices = []
+            cached_masses = []
+            cached_advantages = []
 
             for i, (node, client_state) in enumerate(node_state_tuples):
                 if node.unsampled_log_masses is None:
                     unexpanded_client_states.append(client_state)
                     unexpanded_indices.append(i)
                 else:
-                    advantages = node.children_advantages
-                    if normalize_advantage_by_visit_count:
-                        advantages = node.children_advantages / node.children_visit_counts
+                    cached_indices.append(i)
+                    cached_masses.append(node.unsampled_log_masses)
+                    if track_advantages:
+                        advantages = node.children_advantages
+                        if normalize_advantage_by_visit_count:
+                            advantages = (
+                                node.children_advantages / node.children_visit_counts
+                            )
+                        cached_advantages.append(advantages)
 
-                    log_unnormalized = node.unsampled_log_masses + advantages
-                    max_log = np.max(log_unnormalized)
-                    if not np.isfinite(max_log):
-                        # Every child is exhausted or non-finite. Returning all -inf lets the
-                        # search drop this node instead of producing NaNs from 0/0.
-                        results[i] = np.full_like(log_unnormalized, -np.inf)
-                        continue
-                    unnormalized = np.exp(log_unnormalized - max_log)
-                    with np.errstate(divide="ignore"):
-                        results[i] = np.log(unnormalized / np.sum(unnormalized))
+            if cached_indices:
+                # Normalise every already-expanded node in one block. Cast the float32 masses to
+                # float64 first: the scalar expression added a float64 advantage array, so the
+                # normalisation ran in float64, and WOR's result must not drift.
+                log_unnormalized = np.stack(cached_masses).astype(np.float64)
+                if cached_advantages:
+                    log_unnormalized += np.stack(cached_advantages)
+                max_log = log_unnormalized.max(axis=1)
+                exhausted = ~np.isfinite(max_log)
+                # Every child of such a row is exhausted or non-finite; returning all -inf lets
+                # the search drop the node instead of producing NaNs from 0/0.
+                safe_max = np.where(exhausted, 0.0, max_log)
+                with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+                    unnormalized = np.exp(log_unnormalized - safe_max[:, None])
+                    normalised = np.log(
+                        unnormalized / np.sum(unnormalized, axis=1, keepdims=True)
+                    )
+                normalised[exhausted] = -np.inf
+                for row, index in enumerate(cached_indices):
+                    results[index] = normalised[row]
 
             if unexpanded_client_states:
                 client_fn_results = child_log_probability_fn(unexpanded_client_states)
                 for i, log_probs in zip(unexpanded_indices, client_fn_results):
                     results[i] = log_probs
                     node = node_state_tuples[i][0]
-                    node.unsampled_log_masses = (
-                        log_probs + node.initial_log_mass_if_not_sampled()
+                    node.init_masses(
+                        log_probs, node.initial_log_mass_if_not_sampled()
                     )
-                    node.children_advantages = np.zeros(len(node.unsampled_log_masses))
-                    node.children_visit_counts = np.full(
-                        len(node.unsampled_log_masses), 1e-8
-                    )
+                    if track_advantages:
+                        node.children_advantages = np.zeros(
+                            len(node.unsampled_log_masses)
+                        )
+                        node.children_visit_counts = np.full(
+                            len(node.unsampled_log_masses), 1e-8
+                        )
 
             return typing.cast(List[np.ndarray], results)
 

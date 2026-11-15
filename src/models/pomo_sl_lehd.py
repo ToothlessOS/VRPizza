@@ -21,7 +21,7 @@ import torch
 
 from src.models.pomo_sl import POMOSL, _capture_logprobs
 
-__all__ = ["LEHDPOMOSL"]
+__all__ = ["LEHDPOMOSL", "partial_teacher_forced_train_step"]
 
 
 class LEHDPOMOSL(POMOSL):
@@ -63,25 +63,7 @@ class LEHDPOMOSL(POMOSL):
             A dict with ``loss`` plus whatever :meth:`log_metrics` accepted.
         """
         if phase == "train":
-            # Read the target before resetting: `make_input_td` and `reset` are free to
-            # rewrite the batch's instance fields, and the training target must not move.
-            actions = batch["actions"]
-            valid = batch["valid"]
-            td = self.env.reset_partial(batch)
-
-            captured: dict = {}
-            with _capture_logprobs(captured):
-                out = self.policy(
-                    td,
-                    self.env,
-                    phase="train",
-                    actions=actions,
-                    store_all_logp=True,
-                    return_sum_log_likelihood=False,
-                )
-            out = self.calculate_loss(
-                td, batch, out, valid=valid, logprobs=captured.get("logprobs")
-            )
+            out = partial_teacher_forced_train_step(self, batch)
         else:
             out = self._inference_step(batch, phase)
 
@@ -125,7 +107,50 @@ class LEHDPOMOSL(POMOSL):
         policy_out["ppl"] = ce_loss.detach().exp()
         policy_out["loss"] = ce_loss
         if logprobs is not None:
-            policy_out["accuracy"] = self._token_accuracy(
+            # Resolved on the class rather than `self`: the SIL local-reconstruction module
+            # routes this loss through the shared helper without inheriting `POMOSL`, so
+            # `self._token_accuracy` would not exist on it. Same reason `POMOSL.calculate_loss`
+            # already resolves the class explicitly.
+            policy_out["accuracy"] = POMOSL._token_accuracy(
                 logprobs, policy_out["actions"], mask
             )
         return policy_out
+
+
+def partial_teacher_forced_train_step(module, batch) -> dict:
+    """Run one LEHD-style partial-reconstruction cross-entropy step.
+
+    Shared by :class:`~src.models.LEHDPOMOSL` and the SIL local-reconstruction module, so the
+    partial loss, accuracy capture and metric plumbing are defined once. The caller supplies
+    ``module`` rather than inheriting this method because the SIL module's MRO carries
+    REINFORCE's ``calculate_loss`` for its warm-up phase; calling
+    :meth:`LEHDPOMOSL.calculate_loss` explicitly keeps the two objectives from shadowing each
+    other.
+
+    Args:
+        module: A Lightning module with ``env.reset_partial`` and ``policy``.
+        batch: A partial batch carrying ``actions``, ``valid``, ``start_node``,
+            ``used_capacity0`` and the reduced instance fields.
+
+    Returns:
+        The policy output dict updated by :meth:`LEHDPOMOSL.calculate_loss`.
+    """
+    # Read the target before resetting: `make_input_td` and `reset` are free to rewrite the
+    # batch's instance fields, and the training target must not move.
+    actions = batch["actions"]
+    valid = batch["valid"]
+    td = module.env.reset_partial(batch)
+
+    captured: dict = {}
+    with _capture_logprobs(captured):
+        out = module.policy(
+            td,
+            module.env,
+            phase="train",
+            actions=actions,
+            store_all_logp=True,
+            return_sum_log_likelihood=False,
+        )
+    return LEHDPOMOSL.calculate_loss(
+        module, td, batch, out, valid=valid, logprobs=captured.get("logprobs")
+    )

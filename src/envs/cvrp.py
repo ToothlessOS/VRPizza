@@ -181,6 +181,7 @@ class CVRPEnv(InstanceInputMixin, _RL4COCVRPEnv):
         super().__init__(
             generator_params={"num_loc": self.num_loc, "capacity": self.capacity},
             check_solution=check_solution,
+            seed=self.seed,
             **kwargs,
         )
 
