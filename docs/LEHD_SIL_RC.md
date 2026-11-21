@@ -117,6 +117,13 @@ raw reference `model_state_dict`; the reference's supervised weights are a cheap
 alternative to the RL warm-up. A POMO checkpoint is rejected by key inspection,
 not silently loaded into nothing.
 
+`--subcycles S` / `--subcycle-epochs` enable the chunked schedule: each outer
+cycle repairs one chunk of the fixed store, trains on it, then moves to the next.
+`S=1` is the reference; the default per-chunk epochs preserve the total repair
+work and training rows per outer cycle. Validation runs every epoch, so an
+S-chunked run validates S times more often; `--val-starts` / `--val-augment` are
+the mitigation. Example: `--labels 1000000 --subcycles 10` (100K chunks).
+
 ### Step-matched port (`notebooks/LEHD_sil_rc_step.py`)
 
 Same 200-epoch / 20,000-step protocol as `notebooks/POMO_sil_rc_step.py`: 50
@@ -127,6 +134,10 @@ five 30-epoch label cycles (12,500 fresh instances/cycle, 16 partials each =
 
 The run label is `lehd_sil_rc_step` (the strict arm is `lehd_sil_rc`), so both
 can be listed in one evaluation.
+
+The step arm accepts the same `--subcycles` / `--subcycle-epochs`; S must divide
+the 12,500 labels and keep `100/S` steps per chunk epoch, so the total stays
+20,000 optimizer steps. The run name gains `-s{S}` / `-e{E_c}`.
 
 ## Seeding and reproducibility
 
@@ -142,8 +153,13 @@ Two additional guards matter here:
   `lehd-e1-d6-h8-q16-ff512`); a POMO-initialised sidecar is refused by a LEHD
   run, and a legacy sidecar without the field is treated as POMO so an
   in-progress POMO run stays resumable;
-* checkpoints record the same `backbone`; resuming a POMO checkpoint into the
-  LEHD module raises before `load_state_dict` can fail obscurely.
+* the sidecar also records `subcycles_per_cycle`, `repair_step` and `subcycle`;
+  a sidecar from a different chunk schedule is ignored/regenerated. The
+  checkpoint records the full label schedule (including `subcycle_epochs`) and
+  rejects a cross-schedule resume;
+* checkpoints record the same `backbone` and label schedule; resuming a POMO
+  checkpoint into the LEHD module raises before `load_state_dict` can fail
+  obscurely.
 
 `scripts/verify_lehd_sil_rc.py` checks that re-seeding reproduces every policy
 parameter and that the same label seed reproduces the instance set. As elsewhere
@@ -171,6 +187,14 @@ The strict arm's 1M-label x 100-round repair pass is the dominant cost: millions
 of window reconstructions at six layers per step, roughly 80x the step arm's
 per-cycle repair. Run the step arm first; use `--labels 100000` (or smaller) if
 the strict schedule is needed.
+
+The chunked schedule (`--subcycles S`) repairs one chunk and trains on it before
+the next. With the default per-chunk epochs the total repairs and rows are
+unchanged, but the first chunk's training starts after one chunk of RRC work
+(the one-off full-store greedy/RI bootstrap still happens), and the ~1.2 GB
+sidecar is rewritten after each chunk. Validation runs every epoch, so S chunks
+mean S times more validation per outer cycle; reduce `--val-starts` /
+`--val-augment`.
 
 ## Deliberate deviations
 
@@ -204,6 +228,11 @@ the strict schedule is needed.
     unstable in bf16.
 11. **`--mcts` is not ported.** It reaches into POMO's `PrecomputedCache`; the
     eval driver refuses it for the LEHD label.
+12. **Chunked sub-cycles.** `--subcycles S` interleaves a chunk's repair and
+    training; the reference repairs the whole store first. With the default
+    per-chunk epochs the total repairs and rows are unchanged, but each chunk's
+    teacher is the best snapshot just before it and validation runs S times more
+    often. This is a target-refresh experiment, not on-policy RL.
 
 ## Running it
 
@@ -223,6 +252,9 @@ sbatch scripts/submit_strict_sil_rc.sh
 
 # A cheaper first strict run
 .venv/bin/python notebooks/LEHD_sil_rc.py --labels 100000
+
+# Chunked strict LEHD: 10 x 100K chunks, same total repair/rows
+.venv/bin/python notebooks/LEHD_sil_rc.py --labels 1000000 --subcycles 10
 
 # Warm-start SIL from the reference supervised checkpoint
 .venv/bin/python notebooks/LEHD_sil_rc.py \
@@ -261,7 +293,8 @@ arm, so the gap is directly comparable to the paper's supervised number.
    faithful `reference_rollout`;
 5. the exact CE against the reference model's per-step loss (~1e-7);
 6. RRC monotonicity and coverage with the LEHD policy;
-7. the sidecar/checkpoint backbone guards and a tiny two-phase fit;
+7. the sidecar/checkpoint backbone and chunk-schedule guards, a tiny two-phase
+   fit, and a tiny S=2 chunked exact-CE fit;
 8. seed reproducibility and the evaluation registry.
 
 Regressions: `scripts/verify_sil_rc.py` (the POMO arm must be unchanged),

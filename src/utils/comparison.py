@@ -88,8 +88,9 @@ def check_step_math(
     micro_batch: int,
     accumulate: int,
     samples_per_step: int,
+    steps_per_epoch: int = STEPS_PER_EPOCH,
 ) -> int:
-    """Assert that a micro/accumulation choice produces exactly one step-matched epoch.
+    """Assert that a micro/accumulation choice produces an exact step-matched epoch.
 
     The dataset must be an exact multiple of the effective update size; otherwise Lightning
     emits a short final accumulation group and the step count silently changes. The decoded
@@ -101,12 +102,17 @@ def check_step_math(
         micro_batch: DataLoader batch size.
         accumulate: ``accumulate_grad_batches``.
         samples_per_step: Decoded sequences contributed by one optimizer step.
+        steps_per_epoch: Expected optimizer steps per epoch. The whole-store arms use
+            :data:`STEPS_PER_EPOCH`; a chunked SIL sub-cycle has ``100 / S`` steps per
+            epoch because its dataset is one chunk.
 
     Returns:
-        The number of optimizer steps per epoch (always :data:`STEPS_PER_EPOCH`).
+        The number of optimizer steps per epoch.
     """
     if micro_batch <= 0 or accumulate <= 0:
         raise ValueError(f"{label}: micro_batch and accumulate must be positive")
+    if steps_per_epoch <= 0:
+        raise ValueError(f"{label}: steps_per_epoch must be positive")
     per_step = micro_batch * accumulate
     if rows_per_epoch % per_step != 0:
         raise ValueError(
@@ -115,10 +121,10 @@ def check_step_math(
             "short final accumulation group and change the step count"
         )
     steps = rows_per_epoch // per_step
-    if steps != STEPS_PER_EPOCH:
+    if steps != steps_per_epoch:
         raise ValueError(
             f"{label}: {rows_per_epoch} rows/epoch / {per_step} = {steps} steps, expected "
-            f"{STEPS_PER_EPOCH}"
+            f"{steps_per_epoch}"
         )
     if samples_per_step != SAMPLES_PER_STEP:
         raise ValueError(

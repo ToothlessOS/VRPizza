@@ -41,6 +41,7 @@ from src.models import (  # noqa: E402
     PhaseAccumulationCallback,
     SILRCPOMOLitModule,
 )
+from src.models.pomo_sil_rc import _WarmupThenDecay  # noqa: E402
 from src.rrc import RRCConfig, run_rrc_from_routes  # noqa: E402
 from src.sil_rc import (  # noqa: E402
     LabelStore,
@@ -94,7 +95,7 @@ def make_env_model(num_loc: int = 20):
 
 def verify_insertion() -> None:
     """GLOP-style insertion: feasibility, coverage, determinism and order seeding."""
-    print("\n[1/8] random-insertion constructor")
+    print("\n[1/10] random-insertion constructor")
     gen = make_generator()
     store = generate_instances(gen, count=5, seed=11, block_size=2)
     for row in range(len(store)):
@@ -145,7 +146,7 @@ def verify_insertion() -> None:
 
 def verify_generation() -> None:
     """Instance generation is seeded, integral and block-keyed."""
-    print("\n[2/8] seeded instance generation")
+    print("\n[2/10] seeded instance generation")
     gen = make_generator()
     a = generate_instances(gen, count=7, seed=13, block_size=3)
     b = generate_instances(gen, count=7, seed=13, block_size=3)
@@ -174,7 +175,7 @@ def verify_generation() -> None:
 
 def verify_labels(env, model) -> None:
     """Both label bootstraps are feasible; the store round-trips and validates."""
-    print("\n[3/8] initial labels and label-store persistence")
+    print("\n[3/10] initial labels and label-store persistence")
     gen = make_generator()
     ri = generate_instances(gen, count=6, seed=123, block_size=3)
     info = initial_labels(ri, model, env, init="random_insertion", seed=123)
@@ -244,7 +245,7 @@ def verify_labels(env, model) -> None:
 
 def verify_dataset(env, model) -> None:
     """The partial dataset matches the sample_window oracle and is seeded per item."""
-    print("\n[4/8] in-memory partial dataset")
+    print("\n[4/10] in-memory partial dataset")
     gen = make_generator()
     store = generate_instances(gen, count=5, seed=21, block_size=3)
     initial_labels(store, model, env, init="random_insertion", seed=21)
@@ -315,7 +316,7 @@ def verify_dataset(env, model) -> None:
 
 def verify_rrc_routes(env, model) -> None:
     """run_rrc_from_routes is monotone, splices exactly, and is chunk-stable."""
-    print("\n[5/8] route-in/route-out reconstruction")
+    print("\n[5/10] route-in/route-out reconstruction")
     gen = make_generator()
     store = generate_instances(gen, count=4, seed=31, block_size=2)
     initial_labels(store, model, env, init="random_insertion", seed=31)
@@ -367,7 +368,7 @@ def verify_rrc_routes(env, model) -> None:
 
 def verify_improve(env, model) -> None:
     """One full repair pass is monotone and reports the reference counters."""
-    print("\n[6/8] full label-repair pass")
+    print("\n[6/10] full label-repair pass")
     gen = make_generator()
     store = generate_instances(gen, count=6, seed=41, block_size=3)
     initial_labels(store, model, env, init="random_insertion", seed=41)
@@ -411,9 +412,113 @@ def verify_improve(env, model) -> None:
     )
 
 
+def verify_chunking() -> None:
+    """The chunked schedule partitions labels, seeds chunks and decays LR."""
+    print("\n[9/10] chunked sub-cycle schedule")
+    scheduler = _WarmupThenDecay(1, 0.5, 2)
+    values = [scheduler(epoch) for epoch in range(6)]
+    check(
+        "the LR decays once per full-store pass",
+        values == [1.0, 1.0, 1.0, 0.5, 0.5, 0.25],
+        str(values),
+    )
+
+    gen = make_generator()
+    store = generate_instances(gen, count=6, seed=41, block_size=3)
+    env, _ = make_env_model()
+    model = build_smoke_model(
+        TMP / "chunking_labels.npz",
+        env,
+        subcycles_per_cycle=2,
+        subcycle_epochs=1,
+    )
+    model.labels_per_cycle = len(store)
+    initial_labels(store, model, env, init="random_insertion", seed=41)
+    model.subcycles_per_cycle = 2
+    model.subcycle_epochs = 1
+    model._chunk_order_cache.clear()
+
+    chunks = [model._chunk_indices(0, subcycle) for subcycle in range(2)]
+    flat = np.sort(np.concatenate(chunks))
+    check(
+        "chunks partition the store exactly once",
+        all(chunk is not None and chunk.size > 0 for chunk in chunks)
+        and np.array_equal(flat, np.arange(len(store))),
+        str([chunk.size for chunk in chunks]),
+    )
+    check(
+        "chunk order is deterministic for a fixed seed",
+        np.array_equal(chunks[0], model._chunk_indices(0, 0))
+        and np.array_equal(chunks[1], model._chunk_indices(0, 1)),
+    )
+    model.subcycles_per_cycle = 1
+    check("S=1 has no chunk subset", model._chunk_indices(0, 0) is None)
+
+    model.subcycles_per_cycle = 2
+    full = SILPartialDataset(
+        store,
+        partials_per_instance=2,
+        effective_batch_size=4,
+        w_min=6,
+        w_max=6,
+        seed=99,
+    )
+    chunk = chunks[0]
+    subset = SILPartialDataset(
+        store,
+        partials_per_instance=2,
+        effective_batch_size=4,
+        w_min=6,
+        w_max=6,
+        seed=99,
+        label_indices=chunk,
+    )
+    check(
+        "the chunked dataset exposes only its chunk",
+        len(subset) == chunk.size * 2
+        and set(subset.order.tolist()) == set(chunk.tolist()),
+        f"len {len(subset)}, chunk {chunk.tolist()}",
+    )
+    item = subset[0]
+    label = int(subset.order[0])
+    position = int(np.where(full.order == label)[0][0])
+    full_item = full[position * full.partials_per_instance]
+    check(
+        "forced-w items match the full-store item for the same global label",
+        np.array_equal(item["locs"], full_item["locs"])
+        and np.array_equal(item["actions"], full_item["actions"]),
+    )
+
+    before = store.cost.copy()
+    stats = improve_labels(
+        store,
+        model,
+        env,
+        repair_batch=2,
+        iterations=1,
+        cycle=0,
+        seed=41,
+        w_min=6,
+        w_max=6,
+        indices=chunk,
+    )
+    outside = np.setdiff1d(np.arange(len(store)), chunk)
+    check(
+        "a chunk repair updates only its chunk and reports its size",
+        stats["labels"] == chunk.size
+        and stats["recon_iterations"] == 2 * 1
+        and np.array_equal(store.cost[outside], before[outside]),
+        f"labels {stats['labels']}, outside unchanged",
+    )
+    check(
+        "the chunk repair is monotone",
+        bool((store.cost[chunk] <= before[chunk] + 1e-5).all()),
+    )
+
+
 def verify_step_math() -> None:
     """The step-matched constants give exactly 100 steps per phase epoch."""
-    print("\n[7/8] step protocol")
+    print("\n[7/10] step protocol")
     try:
         C.check_step_math(
             label="sil_rc-warmup",
@@ -429,7 +534,19 @@ def verify_step_math() -> None:
             accumulate=C.SIL_RC_ACCUM,
             samples_per_step=C.SAMPLES_PER_STEP,
         )
+        C.check_step_math(
+            label="sil_rc-sil-chunked",
+            rows_per_epoch=(
+                C.SIL_RC_INSTANCES_PER_CYCLE // 10
+                * C.SIL_RC_PARTIALS_PER_INSTANCE
+            ),
+            micro_batch=C.SIL_RC_MICRO_BATCH,
+            accumulate=C.SIL_RC_ACCUM,
+            samples_per_step=C.SAMPLES_PER_STEP,
+            steps_per_epoch=C.STEPS_PER_EPOCH // 10,
+        )
         check("warm-up and SIL phases each produce 100 steps/epoch", True)
+        check("a S=10 SIL chunk produces 10 steps/chunk-epoch", True)
     except ValueError as error:
         check("warm-up and SIL phases each produce 100 steps/epoch", False, str(error))
     check(
@@ -440,7 +557,13 @@ def verify_step_math() -> None:
     )
 
 
-def build_smoke_model(cache: Path, env):
+def build_smoke_model(
+    cache: Path,
+    env,
+    *,
+    subcycles_per_cycle: int = 1,
+    subcycle_epochs: int | None = None,
+):
     """The tiny two-phase module used by the final fit and resume checks."""
     return SILRCPOMOLitModule(
         env,
@@ -449,6 +572,8 @@ def build_smoke_model(cache: Path, env):
         warmup_data_size=8,
         cycle_epochs=1,
         labels_per_cycle=6,
+        subcycles_per_cycle=subcycles_per_cycle,
+        subcycle_epochs=subcycle_epochs,
         fresh_labels_per_cycle=False,
         init="greedy",
         improve_first_cycle=True,
@@ -469,9 +594,106 @@ def build_smoke_model(cache: Path, env):
     )
 
 
+def verify_chunked_fit() -> None:
+    """A tiny S=2 fit repairs chunk 0 then chunk 1 and resumes without a redraw."""
+    print("\n[10/10] chunked fit and resume")
+    seed_everything(0, workers=True)
+    TMP.mkdir(parents=True, exist_ok=True)
+    cache = TMP / "chunked_labels.npz"
+    ckpt = TMP / "chunked.ckpt"
+    for path in (cache, ckpt):
+        if path.exists():
+            path.unlink()
+
+    def make_env():
+        return SILRCCVRPEnv(
+            data_path=str(DATA),
+            num_loc=100,
+            capacity=50.0,
+            val_instances=10,
+            seed=0,
+            warmup_num_loc=20,
+            warmup_capacity=30.0,
+        )
+
+    env = make_env()
+    model = build_smoke_model(
+        cache, env, subcycles_per_cycle=2, subcycle_epochs=1
+    )
+    trainer = RL4COTrainer(
+        max_epochs=3,
+        accelerator="cpu",
+        devices=1,
+        logger=False,
+        callbacks=[PhaseAccumulationCallback(1, 1, 3)],
+        num_sanity_val_steps=0,
+        precision="32-true",
+    )
+    trainer.fit(model)
+    check(
+        "the chunked fit advances one sub-cycle per epoch",
+        model._labels is not None
+        and len(model._labels) == 6
+        and model._labels_cycle == 0
+        and model._labels_step == 1
+        and cache.is_file(),
+        f"cycle {model._labels_cycle}, step {model._labels_step}",
+    )
+    check(
+        "the sidecar records the chunked progress",
+        model._labels is not None
+        and model._labels.meta.get("subcycles_per_cycle") == 2
+        and model._labels.meta.get("repair_step") == 1
+        and model._labels.meta.get("subcycle") == 1,
+        str(model._labels.meta if model._labels else None),
+    )
+    chunk0 = model._chunk_indices(0, 0)
+    chunk1 = model._chunk_indices(0, 1)
+    check(
+        "the two chunks cover the store",
+        chunk0 is not None
+        and chunk1 is not None
+        and np.array_equal(np.sort(np.concatenate([chunk0, chunk1])), np.arange(6)),
+    )
+    trainer.save_checkpoint(ckpt)
+
+    env2 = make_env()
+    env2.sample_instances = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("labels were regenerated instead of loaded")
+    )
+    model2 = build_smoke_model(
+        cache, env2, subcycles_per_cycle=2, subcycle_epochs=1
+    )
+    trainer2 = RL4COTrainer(
+        max_epochs=4,
+        accelerator="cpu",
+        devices=1,
+        logger=False,
+        callbacks=[PhaseAccumulationCallback(1, 1, 3)],
+        num_sanity_val_steps=0,
+        precision="32-true",
+    )
+    try:
+        Trainer.fit(trainer2, model2, ckpt_path=str(ckpt), weights_only=False)
+        resumed = (
+            model2._labels_cycle == 1
+            and model2._labels_step == 2
+            and model2._best_metric is not None
+        )
+        detail = f"cycle {model2._labels_cycle}, step {model2._labels_step}"
+    except AssertionError as error:
+        resumed = False
+        detail = str(error)
+    check(
+        "a chunked resume loads the sidecar and advances the next chunk",
+        resumed,
+        detail,
+    )
+
+
 def verify_phase_fit_and_resume() -> None:
     """A tiny fit creates/repairs labels; a resume loads the sidecar, not a redraw."""
-    print("\n[8/8] two-phase fit, best snapshot and resume")
+    print("\n[8/10] two-phase fit, best snapshot and resume")
     seed_everything(0, workers=True)
     TMP.mkdir(parents=True, exist_ok=True)
     cache = TMP / "fit_labels.npz"
@@ -580,6 +802,8 @@ def main() -> int:
     verify_improve(env, model)
     verify_step_math()
     verify_phase_fit_and_resume()
+    verify_chunking()
+    verify_chunked_fit()
 
     print()
     if failures:

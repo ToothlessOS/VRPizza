@@ -53,6 +53,19 @@ SIL_RC_LOG_DIR=logs/sil_rc
 # checkpoint directory change with the argument, so resume with the same value.
 STRICT_ARGS="${STRICT_ARGS:-}"
 
+# Optional chunked schedule applied to both arms, e.g.:
+#     SUBCYCLES=10 sbatch scripts/submit_sil_rc.sh
+# The strict arm uses 1M labels; the step arm 12,500 per outer cycle. Add
+# STRICT_ARGS/STEP_ARGS="--subcycle-epochs ..." to change the per-chunk budget.
+SUBCYCLES="${SUBCYCLES:-}"
+CHUNK_ARGS=""
+if [ -n "$SUBCYCLES" ]; then
+    CHUNK_ARGS="--subcycles $SUBCYCLES"
+fi
+STRICT_ARGS="$CHUNK_ARGS ${STRICT_ARGS:-}"
+STEP_ARGS="${STEP_ARGS:-}"
+STEP_ARGS="$CHUNK_ARGS ${STEP_ARGS:-}"
+
 # `.venv/bin/python` rather than `uv run`: concurrent `uv run` invocations contend
 # on the environment lock, and `uv sync` above has already built everything.
 CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 \
@@ -61,7 +74,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 \
 STRICT_PID=$!
 
 CUDA_VISIBLE_DEVICES=1 PYTHONUNBUFFERED=1 \
-    .venv/bin/python notebooks/POMO_sil_rc_step.py \
+    .venv/bin/python notebooks/POMO_sil_rc_step.py $STEP_ARGS \
     > "$SIL_RC_LOG_DIR/step.log" 2>&1 &
 STEP_PID=$!
 

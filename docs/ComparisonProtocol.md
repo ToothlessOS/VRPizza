@@ -35,6 +35,8 @@ rollout, a teacher-forced full trajectory, a LEHD partial, or a sampled partial 
 | LEHD-RL shared | HGS file | 125 x 4 partials x K=4 = 2,000 rollouts | `POMO_rl_lehd_step.py --baseline shared` |
 | SIL-RC | generator, 12,500 fixed per cycle | 125 instances x 16 partials = 2,000 rows | `POMO_sil_rc_step.py` |
 | LEHD-backbone SIL-RC | generator, 12,500 fixed per cycle | 125 instances x 16 partials = 2,000 rows | `LEHD_sil_rc_step.py` |
+| SIL-RC chunked | generator, 12,500 per outer cycle split into S chunks | 125 instances x 16 partials = 2,000 rows | `POMO_sil_rc_step.py --subcycles S` |
+| LEHD-backbone SIL-RC chunked | same | 125 instances x 16 partials = 2,000 rows | `LEHD_sil_rc_step.py --subcycles S` |
 
 The shared arm's 2,000 rollouts are **500 independent partials x 4 correlated samples**, not
 2,000 independent samples; each partial's advantages sum to zero under the shared baseline.
@@ -47,6 +49,13 @@ each cycle regenerates 12,500 CVRP100 instances, improves their labels with 100 
 instance, then trains on 12,500 x 16 = 200,000 partial windows per epoch. Label repair is extra
 compute outside the decoded-sequence count, comparable to the HGS solver's label acquisition for
 the SL arms.
+
+`--subcycles S` splits each 30-epoch cycle into S chunk sub-cycles. Each chunk is repaired with
+the best policy and then trained for 30 chunk-epochs, so the total repair work, rows and optimizer
+steps are unchanged (15,000 SIL steps); the steps per chunk-epoch fall to 100/S and the Lightning
+epoch count rises to 150S. The chunk order is reshuffled per outer cycle. Validation remains per
+Lightning epoch, so the validation count per outer cycle rises by S; S must divide the 12,500
+labels and keep 100/S steps per chunk-epoch.
 
 LEHD-backbone SIL-RC is the same budget with the reference LEHD light encoder / heavy decoder.
 The effective step stays 2,000; the micro-batch falls to 125 x 16 (the six-layer decoder
@@ -80,8 +89,9 @@ the largest value that fits and gradient accumulation for the rest:
 2,000 rows in one full-tour forward is ~41 GiB at N=100 and is deliberately avoided. LEHD's
 `w` is constant per optimizer-step chunk, so a chunk near `w=100` costs the same as a full-tour
 row; do not size LEHD from its ~52 mean. `check_step_math()` in
-`src/utils/comparison.py` asserts `rows_per_epoch == 100 * micro * accumulation` and rejects
-non-divisors.
+`src/utils/comparison.py` asserts `rows_per_epoch == steps_per_epoch * micro * accumulation`;
+the whole-store arms pass 100, a chunked SIL sub-cycle passes 100/S, and non-divisors are
+rejected.
 
 ## Syncing one epoch
 
@@ -129,12 +139,13 @@ draws a random seed and unseeds model init. Generated RL uses a dedicated `seed 
 generator for both instances and start nodes, and resume re-anchors `env._epoch`; file-backed
 draws use per-item NumPy RNGs and `shuffle=False`, so they are worker-count independent.
 
-SIL-RC keys its generated instance sets by `[LABEL_SEED, block]` and `LABEL_SEED + cycle`, its
-repair windows by `[seed, iteration, global_label_index]`, and its training windows by
-`[seed + epoch, label_index, window_index]`. The label sidecar is loaded on resume rather than
-redrawn; it also records the backbone and policy signature, so a POMO-initialised sidecar is
-refused by the LEHD-backbone arm (legacy sidecars count as POMO). The full contract is in
-[SIL_RC.md](SIL_RC.md#seeding-and-reproducibility) and
+SIL-RC keys its generated instance sets by `[LABEL_SEED, block]` and
+`LABEL_SEED + outer`, its chunk order by `[cycle_seed(outer), outer]`, its repair windows by
+`[seed, iteration, global_label_index]` with `seed = LABEL_SEED + repair_step`, and its training
+windows by `[seed + epoch, label_index, window_index]`. The label sidecar is loaded on resume
+rather than redrawn; it records the backbone, policy signature and chunk schedule, so a
+POMO-initialised or differently scheduled sidecar is refused (legacy sidecars count as POMO / S=1).
+The full contract is in [SIL_RC.md](SIL_RC.md#seeding-and-reproducibility) and
 [LEHD_SIL_RC.md](LEHD_SIL_RC.md#seeding-and-reproducibility).
 
 ## What is deliberately not equalized
@@ -150,6 +161,10 @@ refused by the LEHD-backbone arm (legacy sidecars count as POMO). The full contr
 - **SIL-RC method overhead.** Five label cycles x 12,500 instances x 100 RRC rounds, plus the
   5,000-step CVRP20 warm-up. Its training steps decode the same 2,000 partials as the LEHD
   arms, but the pseudo-label generation is compute the other arms do not pay per cycle.
+- **Chunked SIL-RC cadence.** `--subcycles S` keeps the total repairs, rows and optimizer
+  steps, but validates S times more often per outer cycle and rewrites the label sidecar after
+  each chunk. It refreshes one chunk's labels just before training it instead of repairing the
+  whole store at the cycle boundary.
 - **LEHD-backbone SIL-RC compute.** The heavy decoder re-runs six self-attention layers at
   every decode step, so the same 2,000 sequences cost substantially more wall-clock than the
   POMO arm, and its validation monitors one start rather than `N`. The decoded-sequence and

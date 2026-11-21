@@ -231,6 +231,10 @@ class LabelStore:
         # stores; defaulting here keeps an in-progress POMO run resumable.
         meta.setdefault("backbone", "pomo")
         meta.setdefault("policy", "pomo-am-e6-h8-ff512")
+        # Sidecars written before the chunked schedule existed are whole-store
+        # S=1 stores whose repair step is the cycle index.
+        meta.setdefault("subcycles_per_cycle", 1)
+        meta.setdefault("repair_step", int(meta.get("cycle", -1)))
         if expected is not None:
             mismatched = {
                 key: (expected[key], meta.get(key))

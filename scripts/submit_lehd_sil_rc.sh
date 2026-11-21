@@ -56,6 +56,18 @@ LEHD_SIL_RC_LOG_DIR=logs/lehd_sil_rc
 STRICT_ARGS="${STRICT_ARGS:-}"
 STEP_ARGS="${STEP_ARGS:-}"
 
+# Optional chunked schedule applied to both arms, e.g.:
+#     SUBCYCLES=10 sbatch scripts/submit_lehd_sil_rc.sh
+# The strict arm uses 1M labels; the step arm 12,500 per outer cycle. Add
+# STRICT_ARGS/STEP_ARGS="--subcycle-epochs ..." to change the per-chunk budget.
+SUBCYCLES="${SUBCYCLES:-}"
+CHUNK_ARGS=""
+if [ -n "$SUBCYCLES" ]; then
+    CHUNK_ARGS="--subcycles $SUBCYCLES"
+fi
+STRICT_ARGS="$CHUNK_ARGS ${STRICT_ARGS:-}"
+STEP_ARGS="$CHUNK_ARGS ${STEP_ARGS:-}"
+
 # `.venv/bin/python` rather than `uv run`: concurrent `uv run` invocations contend
 # on the environment lock, and `uv sync` above has already built everything.
 CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 \

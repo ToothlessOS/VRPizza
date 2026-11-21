@@ -114,6 +114,19 @@ def main() -> int:
         rejected = True
     check("non-divisor is rejected (RL 50 x 3)", rejected)
 
+    try:
+        C.check_step_math(
+            label="chunked-sil",
+            rows_per_epoch=C.SIL_RC_ROWS_PER_EPOCH // 10,
+            micro_batch=C.SIL_RC_MICRO_BATCH,
+            accumulate=C.SIL_RC_ACCUM,
+            samples_per_step=C.SAMPLES_PER_STEP,
+            steps_per_epoch=C.STEPS_PER_EPOCH // 10,
+        )
+        check("chunked SIL 1,250 x 16 -> 10 steps/chunk", True)
+    except ValueError as exc:
+        check("chunked SIL 1,250 x 16 -> 10 steps/chunk", False, str(exc))
+
     _, num_routes, _ = build_index(resolve_data_path(DATA))
 
     print("\n== supervised 16-start draw ==")

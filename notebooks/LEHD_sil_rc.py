@@ -22,6 +22,13 @@ protocol for an explicit comparison.
 the raw reference ``model_state_dict``; the weights are architecture-compatible,
 so this is a cheap alternative to the RL warm-up.
 
+The optional chunked schedule (``--subcycles S``) splits each outer cycle into
+S chunks: repair one chunk with the best policy, train on it for
+``--subcycle-epochs`` epochs, then move to the next. ``S=1`` is the reference;
+the default per-chunk epochs keep the total repair work and training rows per
+outer cycle unchanged. Validation runs every epoch, so a chunked run validates
+S times more often; ``--val-starts``/``--val-augment`` can reduce that cost.
+
 Run it with the project's virtualenv::
 
     .venv/bin/python notebooks/LEHD_sil_rc.py --smoke
@@ -60,20 +67,22 @@ CAPACITY = 50.0
 WARMUP_NUM_LOC = 20
 WARMUP_CAPACITY = 30.0
 
-WARMUP_EPOCHS = 100
+# Changed based on observation that 20 epochs will do (based on validation gap)
+WARMUP_EPOCHS = 20
 WARMUP_BATCH_SIZE = 64
 WARMUP_DATA_SIZE = 50_000
 
 SIL_CYCLES = 5
 SIL_EPOCHS_PER_CYCLE = 20
 SIL_INSTANCES = 1_000_000
+SUBCYCLES_PER_CYCLE = 200
 RECON_ITERATIONS = 100
 REPAIR_BATCH = 256
 
 #: Effective SIL batch is 1,024, as in the reference; the heavy decoder makes a
 #: 1,024-row micro-batch infeasible, so the split is a memory knob only.
-SIL_MICRO_BATCH = 128
-SIL_ACCUM = 8
+SIL_MICRO_BATCH = 256
+SIL_ACCUM = 4
 PARTIALS_PER_INSTANCE = 1
 
 LR = 1e-4
@@ -128,6 +137,20 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=f"instances in the fixed label set (default {SIL_INSTANCES:,})",
+    )
+    parser.add_argument(
+        "--subcycles",
+        type=int,
+        default=None,
+        help=f"chunks per outer SIL cycle (default {SUBCYCLES_PER_CYCLE}); "
+        "repair one chunk, train on it, then move to the next",
+    )
+    parser.add_argument(
+        "--subcycle-epochs",
+        type=int,
+        default=None,
+        help=f"Lightning epochs per chunk (default {SIL_EPOCHS_PER_CYCLE}); use "
+        f"{SIL_EPOCHS_PER_CYCLE} // --subcycles to keep the old total epoch count",
     )
     parser.add_argument(
         "--recon-iterations",
@@ -189,7 +212,9 @@ def parse_args() -> argparse.Namespace:
         help="repo Lightning checkpoint or raw reference model_state_dict to warm-start",
     )
     parser.add_argument("--resume", action="store_true", help="resume from last.ckpt")
-    parser.add_argument("--ckpt-path", default=None, help="explicit checkpoint to resume from")
+    parser.add_argument(
+        "--ckpt-path", default=None, help="explicit checkpoint to resume from"
+    )
     parser.add_argument(
         "--max-epochs",
         type=int,
@@ -236,13 +261,17 @@ def main() -> None:
     args = parse_args()
     if args.resume and args.ckpt_path is not None:
         raise ValueError("pass either --resume or --ckpt-path, not both")
-    if (args.resume or args.ckpt_path is not None) and args.policy_checkpoint is not None:
+    if (
+        args.resume or args.ckpt_path is not None
+    ) and args.policy_checkpoint is not None:
         raise ValueError(
             "--policy-checkpoint warm-starts from weights only; --resume/--ckpt-path "
             "continue the full training state. Pass only one"
         )
     if args.from_scratch and args.policy_checkpoint is not None:
-        raise ValueError("--from-scratch and --policy-checkpoint are mutually exclusive")
+        raise ValueError(
+            "--from-scratch and --policy-checkpoint are mutually exclusive"
+        )
 
     # -- schedule and bootstrap --------------------------------------------------
     warmup_epochs = (
@@ -252,7 +281,9 @@ def main() -> None:
     if init is None:
         init = "random_insertion" if args.from_scratch else "greedy"
     if args.improve_first_cycle and args.no_improve_first_cycle:
-        raise ValueError("pass either --improve-first-cycle or --no-improve-first-cycle")
+        raise ValueError(
+            "pass either --improve-first-cycle or --no-improve-first-cycle"
+        )
     if args.improve_first_cycle:
         improve_first_cycle = True
     elif args.no_improve_first_cycle:
@@ -261,10 +292,25 @@ def main() -> None:
         improve_first_cycle = init == "greedy"
 
     labels = args.labels if args.labels is not None else SIL_INSTANCES
+    subcycles = args.subcycles if args.subcycles is not None else SUBCYCLES_PER_CYCLE
+    subcycle_epochs = (
+        args.subcycle_epochs
+        if args.subcycle_epochs is not None
+        else SIL_EPOCHS_PER_CYCLE
+    )
+    if subcycles <= 0:
+        raise ValueError("--subcycles must be positive")
+    if subcycles > labels:
+        raise ValueError(f"--subcycles {subcycles} exceeds --labels {labels}")
+    if subcycle_epochs <= 0:
+        raise ValueError("--subcycle-epochs must be positive")
+    chunk_size = (labels + subcycles - 1) // subcycles
     recon_iterations = (
         args.recon_iterations if args.recon_iterations is not None else RECON_ITERATIONS
     )
-    sil_micro = args.sil_micro_batch if args.sil_micro_batch is not None else SIL_MICRO_BATCH
+    sil_micro = (
+        args.sil_micro_batch if args.sil_micro_batch is not None else SIL_MICRO_BATCH
+    )
     sil_accum = args.sil_accum if args.sil_accum is not None else SIL_ACCUM
     sil_effective = sil_micro * sil_accum
     if sil_effective <= 0:
@@ -272,9 +318,11 @@ def main() -> None:
     val_starts = args.val_starts if args.val_starts is not None else VAL_STARTS
     val_augment = args.val_augment if args.val_augment is not None else NUM_AUGMENT
     exact_ce = not args.no_exact_ce and EXACT_CE
-    gradient_checkpointing = not args.no_gradient_checkpointing and GRADIENT_CHECKPOINTING
+    gradient_checkpointing = (
+        not args.no_gradient_checkpointing and GRADIENT_CHECKPOINTING
+    )
 
-    sil_epochs = SIL_CYCLES * SIL_EPOCHS_PER_CYCLE
+    sil_epochs = SIL_CYCLES * subcycles * subcycle_epochs
     max_epochs = warmup_epochs + sil_epochs
     if args.max_epochs is not None:
         max_epochs = args.max_epochs
@@ -283,6 +331,10 @@ def main() -> None:
         f"lehd_sil_rc-strict-vrp{NUM_LOC}-n{labels}-c{SIL_CYCLES}x{SIL_EPOCHS_PER_CYCLE}"
         f"-r{recon_iterations}-{init}-seed{SEED}"
     )
+    if subcycles > 1:
+        run_name = f"{run_name}-s{subcycles}"
+    if subcycle_epochs != SIL_EPOCHS_PER_CYCLE:
+        run_name = f"{run_name}-e{subcycle_epochs}"
 
     # -- smoke overrides ---------------------------------------------------------
     warmup_batch = WARMUP_BATCH_SIZE
@@ -297,10 +349,13 @@ def main() -> None:
             0 if (args.from_scratch or args.policy_checkpoint is not None) else 1
         )
         labels = 6
+        subcycles = min(subcycles, labels)
+        subcycle_epochs = 1
+        chunk_size = (labels + subcycles - 1) // subcycles
         recon_iterations = 1
         repair_batch = 2
         cycle_epochs = 1
-        max_epochs = 2
+        max_epochs = warmup_epochs + subcycles * cycle_epochs
         warmup_batch = 4
         warmup_data = 8
         sil_micro = 2
@@ -357,6 +412,8 @@ def main() -> None:
         warmup_data_size=warmup_data,
         cycle_epochs=cycle_epochs,
         labels_per_cycle=labels,
+        subcycles_per_cycle=subcycles,
+        subcycle_epochs=subcycle_epochs,
         fresh_labels_per_cycle=False,
         init=init,
         improve_first_cycle=improve_first_cycle,
@@ -393,8 +450,9 @@ def main() -> None:
     )
     print(
         f"SIL:     {max_epochs - warmup_epochs} epochs, {SIL_CYCLES} x "
-        f"{cycle_epochs}-epoch cycles, {labels:,} fixed CVRP{NUM_LOC} labels, "
-        f"{recon_iterations} RRC rounds/cycle"
+        f"{subcycles} sub-cycles x {subcycle_epochs}-epoch chunks, "
+        f"{labels:,} fixed CVRP{NUM_LOC} labels ({chunk_size:,}/chunk), "
+        f"{recon_iterations} RRC rounds/outer"
     )
     print(
         f"         {sil_micro} partials x {sil_accum} accumulation = "
@@ -446,7 +504,7 @@ def main() -> None:
 
     print(
         f"best {model.generation_selection_metric}: {model._best_metric}; "
-        f"labels cycle: {model._labels_cycle}"
+        f"labels cycle: {model._labels_cycle}, step: {model._labels_step}"
     )
 
 

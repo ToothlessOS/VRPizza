@@ -67,6 +67,20 @@ def parse_args() -> argparse.Namespace:
         help="override MAX_EPOCHS (total budget, not additional epochs)",
     )
     parser.add_argument(
+        "--subcycles",
+        type=int,
+        default=None,
+        help="chunks per outer SIL cycle (default 1); must divide the 12,500 "
+        "labels and keep 100 steps per whole-store epoch",
+    )
+    parser.add_argument(
+        "--subcycle-epochs",
+        type=int,
+        default=None,
+        help="Lightning epochs per chunk (default 30); use 30 // --subcycles to "
+        "keep the old total epoch count",
+    )
+    parser.add_argument(
         "--run-suffix",
         default="",
         help="appended to the run name/checkpoint directory, e.g. for an ablation",
@@ -77,10 +91,6 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     """Build the environment, model and trainer, then fit."""
     args = parse_args()
-    max_epochs = args.max_epochs if args.max_epochs is not None else C.MAX_EPOCHS
-    max_steps = (
-        args.max_epochs * C.STEPS_PER_EPOCH if args.max_epochs is not None else C.TOTAL_STEPS
-    )
 
     run_name = RUN_NAME
     warmup_epochs = C.SIL_RC_WARMUP_EPOCHS
@@ -100,6 +110,43 @@ def main() -> None:
     num_augment = C.NUM_AUGMENT
     precision = C.PRECISION
 
+    subcycles = args.subcycles if args.subcycles is not None else 1
+    subcycle_epochs = (
+        args.subcycle_epochs if args.subcycle_epochs is not None else cycle_epochs
+    )
+    if subcycles <= 0 or subcycle_epochs <= 0:
+        raise ValueError("--subcycles and --subcycle-epochs must be positive")
+    if subcycles > labels or labels % subcycles != 0:
+        raise ValueError(
+            f"--subcycles {subcycles} must divide the {labels:,} labels"
+        )
+    chunk_size = labels // subcycles
+    chunk_rows = chunk_size * partials
+    per_step = sil_micro * sil_accum
+    if chunk_rows % per_step != 0:
+        raise ValueError(
+            f"chunk rows {chunk_rows:,} must be divisible by "
+            f"micro*accum={per_step:,}"
+        )
+    steps_per_sil_epoch = chunk_rows // per_step
+    if steps_per_sil_epoch * subcycles != C.STEPS_PER_EPOCH:
+        raise ValueError(
+            f"a chunk has {steps_per_sil_epoch} steps and {subcycles} chunks "
+            f"give {steps_per_sil_epoch * subcycles} steps per whole-store "
+            f"epoch, expected {C.STEPS_PER_EPOCH}"
+        )
+    max_epochs = warmup_epochs + C.SIL_RC_CYCLES * subcycles * subcycle_epochs
+    if args.max_epochs is not None:
+        max_epochs = args.max_epochs
+    max_steps = (
+        warmup_epochs * C.STEPS_PER_EPOCH
+        + (max_epochs - warmup_epochs) * steps_per_sil_epoch
+    )
+    if subcycles > 1:
+        run_name = f"{run_name}-s{subcycles}"
+    if subcycle_epochs != cycle_epochs:
+        run_name = f"{run_name}-e{subcycle_epochs}"
+
     # The step protocol is only meaningful at the full sizes; smoke skips it.
     if not args.smoke:
         C.check_step_math(
@@ -111,10 +158,11 @@ def main() -> None:
         )
         C.check_step_math(
             label="sil_rc-sil",
-            rows_per_epoch=C.SIL_RC_ROWS_PER_EPOCH,
+            rows_per_epoch=chunk_rows,
             micro_batch=sil_micro,
             accumulate=sil_accum,
             samples_per_step=C.SAMPLES_PER_STEP,
+            steps_per_epoch=steps_per_sil_epoch,
         )
 
     if args.smoke:
@@ -124,6 +172,10 @@ def main() -> None:
         cycle_epochs = 1
         labels = 4
         partials = 2
+        subcycles = min(subcycles, labels)
+        subcycle_epochs = 1
+        chunk_size = labels // subcycles
+        chunk_rows = chunk_size * partials
         recon_iterations = 1
         repair_batch = 2
         warmup_micro = 4
@@ -131,6 +183,8 @@ def main() -> None:
         warmup_starts = 4
         sil_micro = 2
         sil_accum = 2
+        per_step = sil_micro * sil_accum
+        steps_per_sil_epoch = chunk_rows // per_step
         val_instances = 10
         val_data_size = 4
         val_batch_size = 2
@@ -168,6 +222,8 @@ def main() -> None:
         warmup_data_size=warmup_data,
         cycle_epochs=cycle_epochs,
         labels_per_cycle=labels,
+        subcycles_per_cycle=subcycles,
+        subcycle_epochs=subcycle_epochs,
         fresh_labels_per_cycle=True,
         init="greedy",
         improve_first_cycle=True,
@@ -198,13 +254,17 @@ def main() -> None:
         f"= {C.SIL_RC_WARMUP_SAMPLES_PER_STEP:,} rollouts/step"
     )
     print(
-        f"SIL:     {max_epochs - warmup_epochs} epochs, {labels:,} labels/cycle x "
-        f"{cycle_epochs} epochs x {C.SIL_RC_CYCLES} cycles, {recon_iterations} RRC "
-        f"rounds/cycle, {partials} partials/instance"
+        f"SIL:     {max_epochs - warmup_epochs} epochs, {C.SIL_RC_CYCLES} x "
+        f"{subcycles} sub-cycles x {subcycle_epochs}-epoch chunks, "
+        f"{labels:,} labels/outer ({chunk_size:,}/chunk), {partials} partials/"
+        f"instance, {recon_iterations} RRC rounds/outer"
     )
     print(
         f"         {sil_micro} partials x {sil_accum} accumulation = "
-        f"{sil_micro * sil_accum:,} partials/step; constant LR {C.LR}"
+        f"{sil_micro * sil_accum:,} partials/step; "
+        f"{steps_per_sil_epoch} steps/chunk-epoch x {subcycles} chunks = "
+        f"{steps_per_sil_epoch * subcycles} steps/whole-store epoch; "
+        f"total {max_steps:,} steps; constant LR {C.LR}"
     )
     print(f"Validation monitor: {val_data_size:,} slots, {val_batch_size} per batch")
 
@@ -245,7 +305,7 @@ def main() -> None:
 
     print(
         f"best {model.generation_selection_metric}: {model._best_metric}; "
-        f"labels cycle: {model._labels_cycle}"
+        f"labels cycle: {model._labels_cycle}, step: {model._labels_step}"
     )
 
 
