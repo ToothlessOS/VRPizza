@@ -67,8 +67,24 @@ STRICT_LOG_DIR=logs/sil_rc_strict
 # Optional per-arm arguments. Both default to the full reference configuration
 # (1M labels); the run name/directory change with the arguments, so resume with
 # the same values.
-POMO_ARGS="${POMO_ARGS:-}"
-LEHD_ARGS="${LEHD_ARGS:-}"
+#
+# Optional chunked schedule, applied to both arms:
+#     SUBCYCLES=10 sbatch scripts/submit_strict_sil_rc.sh
+# 1M labels / 10 = 100K chunks; the default per-chunk epoch count preserves the
+# total repair work and training rows per outer cycle. Add SUBCYCLE_EPOCHS to
+# keep a different per-chunk epoch budget.
+SUBCYCLES="${SUBCYCLES:-}"
+SUBCYCLE_EPOCHS="${SUBCYCLE_EPOCHS:-}"
+CHUNK_ARGS=""
+if [ -n "$SUBCYCLES" ]; then
+    CHUNK_ARGS="$CHUNK_ARGS --subcycles $SUBCYCLES"
+fi
+if [ -n "$SUBCYCLE_EPOCHS" ]; then
+    CHUNK_ARGS="$CHUNK_ARGS --subcycle-epochs $SUBCYCLE_EPOCHS"
+fi
+
+POMO_ARGS="$CHUNK_ARGS ${POMO_ARGS:-}"
+LEHD_ARGS="$CHUNK_ARGS ${LEHD_ARGS:-}"
 
 # `.venv/bin/python` rather than `uv run`: concurrent `uv run` invocations contend
 # on the environment lock, and `uv sync` above has already built everything.
@@ -104,6 +120,7 @@ fi
 #        .venv/bin/python notebooks/POMO_sil_rc.py --smoke
 #        .venv/bin/python notebooks/LEHD_sil_rc.py --smoke
 # 2. Run this script with: sbatch scripts/submit_strict_sil_rc.sh
+#    Chunked:              SUBCYCLES=10 sbatch scripts/submit_strict_sil_rc.sh
 # 3. Watch an arm:         tail -f logs/sil_rc_strict/pomo.log   (or lehd.log)
 # 4. Check job state:      sacct -j <JOBID> --format=JobID,State,ExitCode,MaxRSS,ReqMem,Elapsed
 # 5. Resume:               pass --resume to either notebook with the same CLI options;

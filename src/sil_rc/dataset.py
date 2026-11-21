@@ -28,6 +28,8 @@ instance per epoch.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import numpy as np
 
 from torch.utils.data import Dataset
@@ -51,6 +53,8 @@ class SILPartialDataset(Dataset):
         w_min: Minimum window length, inclusive. The reference uses 4.
         w_max: Maximum window length, inclusive. Defaults to the store's ``N``.
         seed: Base seed; callers pass ``seed + epoch``.
+        label_indices: Global store rows to expose, or ``None`` for the whole
+            store. A chunked SIL sub-cycle passes its chunk.
     """
 
     collate_fn = staticmethod(collate_partials)
@@ -63,6 +67,7 @@ class SILPartialDataset(Dataset):
         w_min: int = 4,
         w_max: int | None = None,
         seed: int = 0,
+        label_indices: Sequence[int] | None = None,
     ) -> None:
         self.store = store
         self.partials_per_instance = int(partials_per_instance)
@@ -87,9 +92,24 @@ class SILPartialDataset(Dataset):
             )
 
         rng = np.random.default_rng(int(seed))
-        self.order = rng.permutation(len(store)).astype(np.int64)
-
-        rows = len(store) * self.partials_per_instance
+        if label_indices is None:
+            self.label_indices = None
+            self.order = rng.permutation(len(store)).astype(np.int64)
+            rows = len(store) * self.partials_per_instance
+        else:
+            subset = np.asarray(label_indices, dtype=np.int64)
+            if subset.ndim != 1 or subset.size == 0:
+                raise ValueError("label_indices must be a non-empty 1-D sequence")
+            if subset.min() < 0 or subset.max() >= len(store):
+                raise ValueError(
+                    f"label_indices must be in [0, {len(store)}), got "
+                    f"[{subset.min()}, {subset.max()}]"
+                )
+            if np.unique(subset).size != subset.size:
+                raise ValueError("label_indices must not contain duplicates")
+            self.label_indices = subset
+            self.order = subset[rng.permutation(subset.size)].astype(np.int64)
+            rows = subset.size * self.partials_per_instance
         chunks = -(-rows // self.effective_batch_size)
         self.w_per_chunk = np.asarray(
             [
@@ -104,7 +124,7 @@ class SILPartialDataset(Dataset):
 
     def __len__(self) -> int:
         """Number of partial solutions exposed this epoch."""
-        return len(self.store) * self.partials_per_instance
+        return int(self.order.size) * self.partials_per_instance
 
     def __getitem__(self, index: int) -> dict[str, np.ndarray | np.generic]:
         """Return one partial solution as the ``collate_partials`` contract."""

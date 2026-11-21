@@ -154,13 +154,15 @@ only as a comment in `train.py`, not in the paper's table.
 ### Strict port (`notebooks/POMO_sil_rc.py`)
 
 - Warm-up: 100 epochs x 50,000 CVRP20 instances, batch 64, Adam 1e-4, no LR decay.
-- SIL: 5 cycles x 20 epochs over a fixed 1,000,000 generated CVRP100 set.
+- SIL: 5 cycles x 20 epochs over a fixed 1,000,000 generated CVRP100 set; each
+  cycle can be split into `--subcycles` chunks (see below).
   - initial labels: greedy + first repair (default with a warm-up), or random
     insertion + no first repair (`--from-scratch`);
   - 100 RRC rounds per instance per cycle with the best validation policy;
   - one random sub-path per instance per epoch, batch 1,024, Adam 1e-4, no weight
     decay, gradient clip 10, `MultiStepLR(gamma=0.97)` per SIL epoch;
-  - validation on the HGS100 tail, 10,000 slots, 8 augmentations, N=100 starts.
+  - validation on the HGS100 tail, 10,000 slots, 8 augmentations, N=100 starts
+    (or `--val-starts` / `--val-augment` overrides).
 - `--warmup-checkpoint` starts directly in SIL from a POMO state dict and sets the
   SIL budget to the reference's 100 epochs.
 - The 1M-instance default is expensive; `--labels` and `--smoke` are the first
@@ -172,14 +174,47 @@ only as a comment in `train.py`, not in the paper's table.
   [ComparisonProtocol.md](ComparisonProtocol.md).
 - Warm-up: 50 epochs x 100 steps, 125 CVRP20 instances x 16 starts = 2,000
   rollouts/step (5,000 steps).
-- SIL: 150 epochs, five 30-epoch cycles. Each cycle generates 12,500 fresh CVRP100
-  instances, bootstraps greedy labels, runs 100 RRC rounds, then trains on
-  12,500 instances x 16 partial windows = 200,000 rows/epoch, micro 500 x accum 4
-  = 2,000 partials/step (15,000 steps).
+- SIL: 150 epochs, five 30-epoch cycles (each splittable with `--subcycles`).
+  Each cycle generates 12,500 fresh CVRP100 instances, bootstraps greedy labels,
+  runs 100 RRC rounds, then trains on 12,500 instances x 16 partial windows =
+  200,000 rows/epoch, micro 500 x accum 4 = 2,000 partials/step (15,000 steps).
 - The warm-up and SIL phases use different accumulation factors; a callback sets
   `trainer.accumulate_grad_batches` at each epoch start because Lightning 2.6 does
   not accept an epoch-keyed dict.
 - Validation is the other arms' 2,000-slot, 8-augmentation, N=100-start draw.
+
+### Chunked/streaming schedule (both entry points)
+
+`--subcycles S` (default 1) splits each outer SIL cycle into S chunks. Each
+sub-cycle repairs only its chunk with the best-validation policy, then trains on
+that chunk for `--subcycle-epochs` (default: the per-chunk `cycle_epochs`, 20
+strict / 30 step) before moving to the next. `S=1` is the reference.
+
+- Outer cycle = `(epoch - warmup) // (S * subcycle_epochs)`; global repair step =
+  `(epoch - warmup) // subcycle_epochs`; sub-cycle = repair step `% S`.
+- Chunks are `np.array_split(seeded_permutation(labels), S)`; the permutation is
+  keyed by `[cycle_seed(outer), outer]`. The repair seed is
+  `LABEL_SEED + repair_step`, so `S=1` reproduces the old `LABEL_SEED + cycle`.
+- With the default `subcycle_epochs = cycle_epochs`, each outer cycle repairs
+  every label once and trains `labels * cycle_epochs` rows, exactly like the
+  whole-store arm; only the order changes. The LR decays once per whole-store
+  pass, i.e. every `S` Lightning epochs (the `S=1` schedule is unchanged).
+- `--subcycle-epochs cycle_epochs // S` keeps the old total Lightning-epoch
+  count but trains `1/S` of the rows; the docs and run name record both.
+- Validation runs every Lightning epoch, so an S-chunked run validates S times
+  more often per outer cycle. The strict POMO arm exposes `--val-starts` /
+  `--val-augment` to reduce that cost; the LEHD arm already has them.
+- The sidecar is rewritten after each chunk repair with `repair_step`, `subcycle`,
+  `subcycles_per_cycle`, `subcycle_epochs`; a resume at a chunk boundary loads
+  the sidecar rather than redrawing, and a sidecar/checkpoint from a different
+  schedule is refused (a sidecar is ignored/regenerated; a checkpoint raises).
+- This is a target-refresh experiment, not RL on-policy: the teacher is still the
+  best-validation policy plus RRC, not sampled actions with rewards. The
+  always-on extra cost is the sidecar rewrite; the 1M store is ~1.2 GB.
+- Example: `--labels 1000000 --subcycles 10` gives 100K chunks, 5 outer cycles,
+  and the first chunk's training after the one-off full-store bootstrap and the
+  first 100K repair. The step arm's `--subcycles` requires S to divide 12,500 and
+  keep `100/S` steps per chunk epoch; the total stays 20,000 optimizer steps.
 
 ## Files and reuse
 
@@ -224,25 +259,33 @@ DataLoader worker count.
 - SIL instances use a fixed `LABEL_SEED`, generated in blocks of
   `LABEL_GEN_BLOCK = 10_000` under `manual_seed([LABEL_SEED, block])`. The block
   size is part of the recipe because the generator consumes its RNG by batch
-  shape. The strict arm draws once; the step arm draws `LABEL_SEED + cycle` per
-  cycle; the smoke path uses the same code with smaller counts.
+  shape. The strict arm draws once; the step arm draws `LABEL_SEED + outer` per
+  outer cycle; the smoke path uses the same code with smaller counts.
 - Random insertion is deterministic (polar-angle order, cheapest feasible
   position); `order="random"` seeds `[LABEL_SEED, instance]`. Greedy labels are
   argmax decodes, deterministic given the policy snapshot.
-- Repair uses `RRCConfig.seed = LABEL_SEED + cycle`; `w` is drawn per iteration
-  from `[seed, iteration]` and each window from
+- Chunk order is a seeded permutation per outer cycle:
+  `default_rng([cycle_seed(outer), outer]).permutation(labels)`, split with
+  `np.array_split(..., S)`. The `S=1` path is the identity.
+- Repair uses `RRCConfig.seed = LABEL_SEED + repair_step`; for the whole-store
+  schedule `repair_step == cycle`, so this is the old seed. `w` is drawn per
+  iteration from `[seed, iteration]` and each window from
   `[seed, iteration, global_label_index]`. The global index (not the chunk row) is
   what makes `repair_batch` a pure memory knob.
 - Training windows use `[seed + epoch, label_index, window_index]` per item and
   `[seed + epoch, effective_batch_chunk]` for `w`; the loader does not shuffle.
-  The effective batch size is part of the recipe.
+  The effective batch size is part of the recipe. In a chunked run the `w` key is
+  the chunk's local effective-batch index, so the windows are a fresh sample of
+  the same labels rather than a replay of the whole-store sample.
 - The label sidecar (`sil_rc_labels.npz`) stores the arrays and metadata (count,
-  `num_loc`, capacity, label seed, block size, init, cycle, recon iterations,
-  `backbone`, policy signature). It is written atomically after each full repair
-  pass and validated on load, so a resume neither redraws nor loses the store. A
-  mismatched sidecar is ignored and regenerated; a sidecar from another backbone
-  is refused rather than reused (legacy sidecars without the field count as
-  POMO). Checkpoints record the same backbone and refuse a cross-backbone resume.
+  `num_loc`, capacity, label seed, block size, init, cycle, `repair_step`,
+  `subcycle`, `subcycles_per_cycle`, `subcycle_epochs`, recon iterations,
+  `backbone`, policy signature). It is written atomically after each chunk/full
+  repair and validated on load, so a resume neither redraws nor loses the store.
+  A mismatched sidecar is ignored and regenerated; a sidecar from another
+  backbone or chunk schedule is refused rather than reused (legacy sidecars
+  without the field count as POMO / S=1). Checkpoints record the same schedule and
+  refuse a cross-backbone or cross-schedule resume.
 - The repair policy is the `val/reward_greedy` best snapshot, saved in the
   checkpoint; after a resume the same weights repair the same labels.
 - Data and schedule are reproducible exactly. Training is not promised bitwise on
@@ -292,6 +335,12 @@ DataLoader worker count.
     `best_epoch + 1`, so epoch indices can repeat while the scheduler keeps
     stepping. This port uses a monotonic global epoch; the number of training
     epochs, optimizer steps and the once-per-epoch LR decay are unchanged.
+17. **Chunked sub-cycles.** `--subcycles S` interleaves the repair and training
+    blocks; the reference repairs the whole store first. With the default
+    per-chunk epochs the total repair work and rows per outer cycle are
+    unchanged, but each chunk's teacher is the best snapshot just before it and
+    validation runs S times more often per outer cycle. This is a target-refresh
+    experiment, not on-policy RL.
 
 ## Running it
 
@@ -312,6 +361,12 @@ sbatch scripts/submit_strict_sil_rc.sh
 
 # Strict arm on a smaller first run
 .venv/bin/python notebooks/POMO_sil_rc.py --labels 100000
+
+# Chunked strict arm: 10 x 100K chunks, same total repair/rows as the strict run
+.venv/bin/python notebooks/POMO_sil_rc.py --labels 1000000 --subcycles 10
+
+# Both strict backbones, chunked
+SUBCYCLES=10 sbatch scripts/submit_strict_sil_rc.sh
 ```
 
 Evaluate a checkpoint with the existing driver; the run prefix is `sil_rc`:
@@ -337,7 +392,11 @@ Evaluate a checkpoint with the existing driver; the run prefix is `sil_rc`:
    50 + 150 = 200-epoch schedule;
 8. a tiny two-phase fit that creates labels and a best snapshot, and a checkpoint
    resume that must load the sidecar rather than redraw it, plus the step env's
-   start-node attachment.
+   start-node attachment;
+9. the chunked schedule: LR divisor, seeded chunk partition, subset dataset and
+   repair isolation, and a tiny S=2 fit with sidecar progress and a resume that
+   does not redraw;
+10. the chunked step-math identity (S=10 -> 10 steps/chunk, 20,000 total steps).
 
 `docs/` and the reference-vs-port table above are the record of where this port
 deliberately differs from the official implementation.

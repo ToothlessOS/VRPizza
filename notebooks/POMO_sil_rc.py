@@ -16,6 +16,14 @@ The 1,000,000-instance default is the reference's commented CVRP100 entry
 ``--smoke`` for a pipeline check. The label store is cached at
 ``<checkpoint_dir>/sil_rc_labels.npz`` so a resume does not redraw it.
 
+The optional chunked schedule (``--subcycles S``) splits each outer cycle into
+S chunks: it repairs only the current chunk with the best validation policy,
+trains on it for ``--subcycle-epochs`` epochs, then moves to the next chunk.
+``S=1`` is the whole-store reference; the default per-chunk epoch count keeps
+the total repair work and training rows per outer cycle unchanged. The POMO
+validation is expensive, so a chunked run can pass ``--val-starts 1`` and/or
+``--val-augment 1`` to reduce the per-epoch cost.
+
 Initial labels follow the reference's two paths:
 
 * ``--init greedy`` (default when a warm-up is present): one model greedy rollout
@@ -73,6 +81,7 @@ WARMUP_DATA_SIZE = 50_000
 SIL_CYCLES = 5
 SIL_EPOCHS_PER_CYCLE = 20
 SIL_INSTANCES = 1_000_000
+SUBCYCLES_PER_CYCLE = 1
 RECON_ITERATIONS = 100
 REPAIR_BATCH = 1024
 
@@ -88,6 +97,8 @@ GRADIENT_CLIP_VAL = 10.0
 VAL_BATCH_SIZE = 256
 VAL_DATA_SIZE = 10_000
 NUM_AUGMENT = 8
+#: ``None`` keeps POMO's N starts; a chunked run can pass ``--val-starts 1``.
+VAL_STARTS = None
 LABEL_SEED = 0
 SEED = 0
 
@@ -129,6 +140,20 @@ def parse_args() -> argparse.Namespace:
         help=f"instances in the fixed label set (default {SIL_INSTANCES:,})",
     )
     parser.add_argument(
+        "--subcycles",
+        type=int,
+        default=None,
+        help=f"chunks per outer SIL cycle (default {SUBCYCLES_PER_CYCLE}); "
+        "repair one chunk, train on it, then move to the next",
+    )
+    parser.add_argument(
+        "--subcycle-epochs",
+        type=int,
+        default=None,
+        help=f"Lightning epochs per chunk (default {SIL_EPOCHS_PER_CYCLE}); use "
+        f"{SIL_EPOCHS_PER_CYCLE} // --subcycles to keep the old total epoch count",
+    )
+    parser.add_argument(
         "--recon-iterations",
         type=int,
         default=None,
@@ -145,6 +170,19 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=f"SIL gradient accumulation (default {SIL_ACCUM})",
+    )
+    parser.add_argument(
+        "--val-starts",
+        type=int,
+        default=None,
+        help="POMO starts for validation (default: the env's N starts); "
+        "--val-starts 1 is useful for a chunked run",
+    )
+    parser.add_argument(
+        "--val-augment",
+        type=int,
+        default=None,
+        help=f"dihedral augmentations for validation (default {NUM_AUGMENT})",
     )
     parser.add_argument(
         "--warmup-checkpoint",
@@ -195,6 +233,21 @@ def main() -> None:
         improve_first_cycle = init == "greedy"
 
     labels = args.labels if args.labels is not None else SIL_INSTANCES
+    subcycles = (
+        args.subcycles if args.subcycles is not None else SUBCYCLES_PER_CYCLE
+    )
+    subcycle_epochs = (
+        args.subcycle_epochs
+        if args.subcycle_epochs is not None
+        else SIL_EPOCHS_PER_CYCLE
+    )
+    if subcycles <= 0:
+        raise ValueError("--subcycles must be positive")
+    if subcycles > labels:
+        raise ValueError(f"--subcycles {subcycles} exceeds --labels {labels}")
+    if subcycle_epochs <= 0:
+        raise ValueError("--subcycle-epochs must be positive")
+    chunk_size = (labels + subcycles - 1) // subcycles
     recon_iterations = (
         args.recon_iterations if args.recon_iterations is not None else RECON_ITERATIONS
     )
@@ -203,11 +256,13 @@ def main() -> None:
     sil_effective = sil_micro * sil_accum
     if sil_effective % sil_micro != 0:
         raise AssertionError("effective SIL batch must be a multiple of the micro-batch")
+    val_starts = args.val_starts if args.val_starts is not None else VAL_STARTS
+    val_augment = args.val_augment if args.val_augment is not None else NUM_AUGMENT
     # The strict arm deliberately allows a short final accumulation group (1M labels
     # / 1024 is not integral, matching the reference's full-dataset epoch). Only the
     # step-matched arm, whose step count is the comparison unit, requires exactness.
 
-    sil_epochs = SIL_CYCLES * SIL_EPOCHS_PER_CYCLE
+    sil_epochs = SIL_CYCLES * subcycles * subcycle_epochs
     max_epochs = warmup_epochs + sil_epochs
     if args.max_epochs is not None:
         max_epochs = args.max_epochs
@@ -216,6 +271,10 @@ def main() -> None:
         f"sil-rc-strict-vrp{NUM_LOC}-n{labels}-c{SIL_CYCLES}x{SIL_EPOCHS_PER_CYCLE}"
         f"-r{recon_iterations}-{init}-seed{SEED}"
     )
+    if subcycles > 1:
+        run_name = f"{run_name}-s{subcycles}"
+    if subcycle_epochs != SIL_EPOCHS_PER_CYCLE:
+        run_name = f"{run_name}-e{subcycle_epochs}"
 
     # -- smoke overrides ---------------------------------------------------------
     warmup_batch = WARMUP_BATCH_SIZE
@@ -224,17 +283,20 @@ def main() -> None:
     repair_batch = REPAIR_BATCH
     val_batch_size = VAL_BATCH_SIZE
     val_data_size = VAL_DATA_SIZE
-    num_augment = NUM_AUGMENT
+    num_augment = val_augment
     precision = "bf16-mixed"
     if args.smoke:
         warmup_epochs = (
             0 if (args.from_scratch or args.warmup_checkpoint is not None) else 1
         )
         labels = 6
+        subcycles = min(subcycles, labels)
+        subcycle_epochs = 1
+        chunk_size = (labels + subcycles - 1) // subcycles
         recon_iterations = 1
         repair_batch = 3
         cycle_epochs = 1
-        max_epochs = 2
+        max_epochs = warmup_epochs + subcycles * cycle_epochs
         warmup_batch = 4
         warmup_data = 8
         sil_micro = 2
@@ -242,6 +304,7 @@ def main() -> None:
         sil_effective = sil_micro * sil_accum
         val_batch_size = 2
         val_data_size = 4
+        val_augment = 1
         num_augment = 1
         precision = "32-true"
         run_name = f"{run_name}-smoke"
@@ -286,6 +349,8 @@ def main() -> None:
         warmup_data_size=warmup_data,
         cycle_epochs=cycle_epochs,
         labels_per_cycle=labels,
+        subcycles_per_cycle=subcycles,
+        subcycle_epochs=subcycle_epochs,
         fresh_labels_per_cycle=False,
         init=init,
         improve_first_cycle=improve_first_cycle,
@@ -310,6 +375,9 @@ def main() -> None:
         dataloader_num_workers=0,
     )
 
+    if val_starts is not None:
+        model.inference_num_starts = val_starts
+
     if args.warmup_checkpoint is not None:
         checkpoint = torch.load(
             args.warmup_checkpoint, map_location="cpu", weights_only=False
@@ -327,13 +395,15 @@ def main() -> None:
     )
     print(
         f"SIL:     {max_epochs - warmup_epochs} epochs, {SIL_CYCLES} x "
-        f"{cycle_epochs}-epoch cycles, {labels:,} fixed CVRP{NUM_LOC} labels, "
-        f"{recon_iterations} RRC rounds/cycle"
+        f"{subcycles} sub-cycles x {subcycle_epochs}-epoch chunks, "
+        f"{labels:,} fixed CVRP{NUM_LOC} labels ({chunk_size:,}/chunk), "
+        f"{recon_iterations} RRC rounds/outer"
     )
     print(
         f"         {sil_micro} partials x {sil_accum} accumulation = "
         f"{sil_effective:,} partials/step; init={init}, "
-        f"improve_first_cycle={improve_first_cycle}"
+        f"improve_first_cycle={improve_first_cycle}, val_starts={val_starts}, "
+        f"val_augment={val_augment}"
     )
 
     callbacks = [accum_callback, RichModelSummary(max_depth=3)]
@@ -375,7 +445,7 @@ def main() -> None:
 
     print(
         f"best {model.generation_selection_metric}: {model._best_metric}; "
-        f"labels cycle: {model._labels_cycle}"
+        f"labels cycle: {model._labels_cycle}, step: {model._labels_step}"
     )
 
 

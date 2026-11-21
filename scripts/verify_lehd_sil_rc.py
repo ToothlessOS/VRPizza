@@ -598,6 +598,95 @@ def verify_guards() -> None:
         and {"label_mean_cost", "recon_iterations", "labels"} <= set(fit_model._label_metrics),
     )
 
+    # The chunk schedule is part of both guards: a whole-store sidecar or
+    # checkpoint cannot silently drive an S=2 run.
+    try:
+        LabelStore.load(cache, expected={"subcycles_per_cycle": 2})
+        sidecar_schedule_rejected = False
+    except ValueError:
+        sidecar_schedule_rejected = True
+    check("an S=1 sidecar is refused by an S=2 run", sidecar_schedule_rejected)
+
+    checkpoint_path = TMP / "s1.ckpt"
+    trainer.save_checkpoint(checkpoint_path)
+    chunk_cache = TMP / "chunked_labels.npz"
+    if chunk_cache.exists():
+        chunk_cache.unlink()
+    chunked_env = SILRCCVRPEnv(
+        data_path=str(DATA),
+        num_loc=100,
+        capacity=50.0,
+        val_instances=10,
+        seed=0,
+        warmup_num_loc=20,
+        warmup_capacity=30.0,
+    )
+    chunked_model = SILRCLEHDLitModule(
+        chunked_env,
+        warmup_epochs=1,
+        warmup_batch_size=4,
+        warmup_data_size=8,
+        cycle_epochs=1,
+        labels_per_cycle=6,
+        subcycles_per_cycle=2,
+        subcycle_epochs=1,
+        fresh_labels_per_cycle=False,
+        init="greedy",
+        improve_first_cycle=True,
+        recon_iterations=1,
+        repair_batch=3,
+        partials_per_instance=1,
+        sil_batch_size=2,
+        sil_effective_batch_size=6,
+        lr_gamma=0.97,
+        label_seed=0,
+        label_cache_path=str(chunk_cache),
+        batch_size=4,
+        train_data_size=8,
+        val_batch_size=2,
+        val_data_size=4,
+        num_augment=1,
+        dataloader_num_workers=0,
+        gradient_checkpointing=False,
+    )
+    try:
+        chunked_model.on_load_checkpoint(
+            torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        )
+        checkpoint_schedule_rejected = False
+    except ValueError:
+        checkpoint_schedule_rejected = True
+    check(
+        "an S=1 checkpoint is refused by an S=2 module",
+        checkpoint_schedule_rejected,
+    )
+
+    chunked_trainer = RL4COTrainer(
+        max_epochs=3,
+        accelerator="cpu",
+        devices=1,
+        logger=False,
+        callbacks=[PhaseAccumulationCallback(1, 1, 3)],
+        num_sanity_val_steps=0,
+        precision="32-true",
+    )
+    chunked_trainer.fit(chunked_model)
+    check(
+        "the chunked LEHD fit advances one sub-cycle per epoch",
+        chunked_model._labels is not None
+        and chunked_model._labels_cycle == 0
+        and chunked_model._labels_step == 1
+        and chunked_model._labels.meta.get("subcycles_per_cycle") == 2
+        and chunk_cache.is_file(),
+        f"cycle {chunked_model._labels_cycle}, step {chunked_model._labels_step}",
+    )
+    check(
+        "the chunked LEHD exact-CE metrics report the chunk",
+        chunked_model._label_metrics is not None
+        and chunked_model._label_metrics.get("labels") == 3,
+        str(chunked_model._label_metrics),
+    )
+
 
 def verify_seed_reproducibility() -> None:
     """Re-seeding reproduces the policy and the generated instances."""

@@ -29,6 +29,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
+
 from lightning.pytorch.callbacks import Callback
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
@@ -83,22 +85,27 @@ class PhaseAccumulationCallback(Callback):
 
 
 class _WarmupThenDecay:
-    """``LambdaLR`` multiplier: constant during warm-up, ``gamma`` per epoch after.
+    """``LambdaLR`` multiplier: constant during warm-up, ``gamma`` per full pass.
 
     A module-level picklable callable rather than a lambda, so the scheduler can be
     rebuilt from the checkpoint's hyperparameters. ``last_epoch`` is the index the
-    multiplier receives, so the first SIL epoch is at the base LR and each later one
-    is ``gamma`` times the previous.
+    multiplier receives. ``epoch_divisor`` is the number of sub-cycles per outer
+    cycle: a chunked outer cycle covers the whole label store once every
+    ``epoch_divisor`` Lightning epochs, so the decay count matches the whole-store
+    schedule. ``epoch_divisor=1`` is the reference schedule.
     """
 
-    def __init__(self, warmup_epochs: int, gamma: float) -> None:
+    def __init__(
+        self, warmup_epochs: int, gamma: float, epoch_divisor: int = 1
+    ) -> None:
         self.warmup_epochs = int(warmup_epochs)
         self.gamma = float(gamma)
+        self.epoch_divisor = int(epoch_divisor)
 
     def __call__(self, epoch: int) -> float:
         if epoch <= self.warmup_epochs:
             return 1.0
-        return self.gamma ** (epoch - self.warmup_epochs)
+        return self.gamma ** ((epoch - self.warmup_epochs) // self.epoch_divisor)
 
 
 class SILRCPOMOLitModule(POMORL):
@@ -112,8 +119,18 @@ class SILRCPOMOLitModule(POMORL):
         warmup_batch_size: Generated instances per warm-up step.
         warmup_data_size: Generated instances per warm-up epoch.
         cycle_epochs: SIL epochs per label cycle (20 strict, 30 step-matched).
+            With ``subcycles_per_cycle > 1`` this is the number of epochs per
+            chunk, and one outer cycle spans ``subcycles_per_cycle *
+            subcycle_epochs`` Lightning epochs.
         labels_per_cycle: Instances in the label store. ``1_000_000`` for the strict
             reference configuration, ``12_500`` for the step-matched arm.
+        subcycles_per_cycle: Number of chunks per outer label cycle. ``1`` (the
+            default) keeps the whole-store reference schedule; ``S > 1`` repairs
+            one chunk and trains on it before moving to the next.
+        subcycle_epochs: Lightning epochs per chunk. Defaults to ``cycle_epochs``,
+            so the total repair work and training rows per outer cycle match the
+            whole-store schedule; pass ``cycle_epochs // S`` to keep the old
+            number of Lightning epochs instead.
         fresh_labels_per_cycle: Generate a new instance set at every cycle instead
             of improving the same one. The step-matched arm sets this because its
             label budget is per cycle; the strict arm keeps the reference's fixed
@@ -154,6 +171,8 @@ class SILRCPOMOLitModule(POMORL):
         warmup_data_size: int = 50_000,
         cycle_epochs: int = 20,
         labels_per_cycle: int = 1_000_000,
+        subcycles_per_cycle: int = 1,
+        subcycle_epochs: int | None = None,
         fresh_labels_per_cycle: bool = False,
         init: str = "greedy",
         improve_first_cycle: bool = True,
@@ -184,6 +203,24 @@ class SILRCPOMOLitModule(POMORL):
             raise ValueError("recon_iterations and repair_batch must be positive")
         if partials_per_instance <= 0:
             raise ValueError("partials_per_instance must be positive")
+        if subcycles_per_cycle <= 0:
+            raise ValueError(
+                f"subcycles_per_cycle must be positive, got {subcycles_per_cycle}"
+            )
+        if subcycles_per_cycle > labels_per_cycle:
+            raise ValueError(
+                f"subcycles_per_cycle {subcycles_per_cycle} exceeds "
+                f"labels_per_cycle {labels_per_cycle}"
+            )
+        # Resolve the local (not just the attribute): `save_hyperparameters` walks
+        # this frame, so leaving `None` here would store an unusable schedule.
+        if subcycle_epochs is None:
+            subcycle_epochs = cycle_epochs
+        subcycle_epochs = int(subcycle_epochs)
+        if subcycle_epochs <= 0:
+            raise ValueError(
+                f"subcycle_epochs must be positive, got {subcycle_epochs}"
+            )
         if sil_effective_batch_size is None:
             sil_effective_batch_size = sil_batch_size
         if sil_effective_batch_size % sil_batch_size != 0:
@@ -199,6 +236,8 @@ class SILRCPOMOLitModule(POMORL):
         self.warmup_data_size = int(warmup_data_size)
         self.cycle_epochs = int(cycle_epochs)
         self.labels_per_cycle = int(labels_per_cycle)
+        self.subcycles_per_cycle = int(subcycles_per_cycle)
+        self.subcycle_epochs = int(subcycle_epochs)
         self.fresh_labels_per_cycle = bool(fresh_labels_per_cycle)
         self.init = init
         self.improve_first_cycle = bool(improve_first_cycle)
@@ -244,6 +283,8 @@ class SILRCPOMOLitModule(POMORL):
 
         self._labels: LabelStore | None = None
         self._labels_cycle: int | None = None
+        self._labels_step: int | None = None
+        self._chunk_order_cache: dict[int, np.ndarray] = {}
         self._label_metrics: dict | None = None
         self._label_metrics_epoch: int | None = None
         self._best_policy_state: dict | None = None
@@ -265,6 +306,18 @@ class SILRCPOMOLitModule(POMORL):
     def _is_sil(self) -> bool:
         """Whether the current epoch belongs to the SIL phase."""
         return self.current_epoch >= self.warmup_epochs
+
+    def on_train_start(self) -> None:
+        """Refuse a chunked schedule whose loader is not rebuilt every epoch."""
+        if self.subcycles_per_cycle == 1 or self.trainer is None:
+            return
+        reload = getattr(self.trainer, "reload_dataloaders_every_n_epochs", 0)
+        if reload != 1:
+            raise ValueError(
+                "chunked SIL requires reload_dataloaders_every_n_epochs=1; got "
+                f"{reload}. The active chunk changes at every epoch boundary, so a "
+                "stale loader would train on the previous chunk."
+            )
 
     def shared_step(self, batch, batch_idx: int, phase: str, dataloader_idx=None) -> dict:
         """REINFORCE during warm-up, partial CE during SIL, shared inference otherwise."""
@@ -314,6 +367,7 @@ class SILRCPOMOLitModule(POMORL):
             )
 
         self._ensure_labels()
+        chunk = self._chunk_indices(self._cycle_index(), self._subcycle_index())
         dataset = SILPartialDataset(
             self._labels,
             partials_per_instance=self.partials_per_instance,
@@ -321,6 +375,7 @@ class SILRCPOMOLitModule(POMORL):
             w_min=self.w_min,
             w_max=self.w_max,
             seed=self.env.seed + self.current_epoch,
+            label_indices=chunk,
         )
         return DataLoader(
             dataset,
@@ -383,19 +438,62 @@ class SILRCPOMOLitModule(POMORL):
     # -- label cycles -------------------------------------------------------------
 
     def _cycle_index(self) -> int:
-        """Zero-based SIL cycle containing the current epoch."""
-        return (self.current_epoch - self.warmup_epochs) // self.cycle_epochs
+        """Zero-based outer SIL cycle containing the current epoch."""
+        return (self.current_epoch - self.warmup_epochs) // (
+            self.subcycles_per_cycle * self.subcycle_epochs
+        )
 
-    def _cycle_seed(self, cycle: int) -> int:
-        """Base seed of ``cycle``'s instance set."""
-        return self.label_seed + (cycle if self.fresh_labels_per_cycle else 0)
+    def _repair_index(self) -> int:
+        """Global sub-cycle index: one repair step per ``subcycle_epochs``."""
+        return (self.current_epoch - self.warmup_epochs) // self.subcycle_epochs
 
-    def _expected_label_meta(self, cycle: int) -> dict:
+    def _subcycle_index(self) -> int:
+        """Zero-based sub-cycle within the current outer cycle."""
+        return self._repair_index() % self.subcycles_per_cycle
+
+    def _cycle_seed(self, outer: int) -> int:
+        """Base seed of the outer cycle's instance set."""
+        return self.label_seed + (outer if self.fresh_labels_per_cycle else 0)
+
+    def _chunk_order(self, outer: int) -> np.ndarray:
+        """Seeded label order for one outer cycle, cached per outer cycle."""
+        if outer not in self._chunk_order_cache:
+            rng = np.random.default_rng([self._cycle_seed(outer), int(outer)])
+            self._chunk_order_cache[outer] = rng.permutation(
+                self.labels_per_cycle
+            ).astype(np.int64)
+        return self._chunk_order_cache[outer]
+
+    def _chunk_indices(self, outer: int, subcycle: int) -> np.ndarray | None:
+        """Global store rows of one sub-cycle's chunk; ``None`` for S=1."""
+        if self.subcycles_per_cycle == 1:
+            return None
+        chunks = np.array_split(self._chunk_order(outer), self.subcycles_per_cycle)
+        return chunks[int(subcycle)]
+
+    def _label_schedule(self) -> dict:
+        """The label/repair recipe persisted with the checkpoint."""
+        return {
+            "count": int(self.labels_per_cycle),
+            "fresh": bool(self.fresh_labels_per_cycle),
+            "label_seed": int(self.label_seed),
+            "init": self.init,
+            "improve_first_cycle": bool(self.improve_first_cycle),
+            "recon_iterations": int(self.recon_iterations),
+            "subcycles_per_cycle": int(self.subcycles_per_cycle),
+            "subcycle_epochs": int(self.subcycle_epochs),
+            "backbone": self.BACKBONE,
+            "policy": self.policy_signature(),
+        }
+
+    def _expected_label_meta(self, outer: int) -> dict:
         """Metadata a sidecar must match before it is reused.
 
-        A fresh-per-cycle store is keyed by ``label_seed + cycle``; a fixed-instance
-        store by the base seed. Including the appropriate seed here is what stops a
-        stale sidecar from a different cycle being mistaken for this one's.
+        A fresh-per-outer-cycle store is keyed by ``label_seed + outer``; a
+        fixed-instance store by the base seed. Including the appropriate seed here
+        is what stops a stale sidecar from a different outer cycle being mistaken
+        for this one's. ``subcycles_per_cycle`` is part of the recipe because it
+        defines the chunk membership the stored labels were repaired with.
         """
         expected = {
             "num_loc": int(self.env.num_loc),
@@ -404,65 +502,122 @@ class SILRCPOMOLitModule(POMORL):
             "block_size": LABEL_GEN_BLOCK,
             "init": self.init,
             "recon_iterations": int(self.recon_iterations),
-            "label_seed": int(self._cycle_seed(cycle)),
+            "label_seed": int(self._cycle_seed(outer)),
+            "subcycles_per_cycle": int(self.subcycles_per_cycle),
             "backbone": self.BACKBONE,
             "policy": self.policy_signature(),
         }
         return expected
 
     def _ensure_labels(self) -> None:
-        """Build, load or repair the label store for the current SIL cycle."""
-        cycle = self._cycle_index()
-        if self._labels is not None and self._labels_cycle == cycle:
+        """Build, load or repair the label store for the current sub-cycle."""
+        outer = self._cycle_index()
+        step = self._repair_index()
+        subcycle = self._subcycle_index()
+
+        # Already at/past this repair step in this outer cycle: never lower the
+        # pointer. A sidecar newer than the resumed checkpoint is authoritative
+        # for label progress.
+        if (
+            self._labels is not None
+            and self._labels_cycle == outer
+            and self._labels_step is not None
+            and self._labels_step >= step
+        ):
+            if self._labels_step > step:
+                log.warning(
+                    "label store is ahead of the checkpoint (step %s > %s); "
+                    "keeping it",
+                    self._labels_step,
+                    step,
+                )
             return
 
         # Try the sidecar once per process. A fixed-instance store from an earlier
-        # cycle is usable and only needs another repair pass; a fresh-per-cycle
-        # store is usable only when it is already this cycle's.
+        # outer cycle is usable and only needs the current chunk repaired; a
+        # fresh-per-outer store is usable only when it is already this outer's.
         if self._labels is None and self.label_cache_path is not None:
             path = Path(self.label_cache_path)
             if path.is_file():
                 try:
                     loaded = LabelStore.load(
-                        path, expected=self._expected_label_meta(cycle)
+                        path, expected=self._expected_label_meta(outer)
                     )
                     if len(loaded) != self.labels_per_cycle:
                         raise ValueError(
                             f"sidecar has {len(loaded)} labels, expected "
                             f"{self.labels_per_cycle}"
                         )
+                    loaded_cycle = int(loaded.meta.get("cycle", -1))
+                    loaded_step = int(loaded.meta.get("repair_step", loaded_cycle))
+                    if loaded_step // self.subcycles_per_cycle != loaded_cycle:
+                        raise ValueError(
+                            "sidecar cycle/repair_step are inconsistent with "
+                            f"subcycles_per_cycle={self.subcycles_per_cycle}"
+                        )
                     self._labels = loaded
-                    self._labels_cycle = int(loaded.meta.get("cycle", -1))
+                    self._labels_cycle = loaded_cycle
+                    self._labels_step = loaded_step
                     log.info(
-                        "loaded SIL label store from %s (cycle %s)",
+                        "loaded SIL label store from %s (cycle %s, step %s)",
                         path,
                         self._labels_cycle,
+                        self._labels_step,
                     )
                 except (ValueError, OSError) as error:
                     log.warning("ignoring SIL label sidecar %s: %s", path, error)
                     self._labels = None
                     self._labels_cycle = None
+                    self._labels_step = None
 
         usable = self._labels is not None and (
-            not self.fresh_labels_per_cycle or self._labels_cycle == cycle
+            not self.fresh_labels_per_cycle or self._labels_cycle == outer
         )
         if not usable:
             self._labels = self.env.sample_instances(
-                self.labels_per_cycle, self._cycle_seed(cycle)
+                self.labels_per_cycle, self._cycle_seed(outer)
             )
             self._labels_cycle = None
+            self._labels_step = None
             self._label_metrics = self._initial_labels()
             self._index_label_metrics(self._label_metrics)
 
-        if self._labels_cycle is None or self._labels_cycle < cycle:
-            if self.improve_first_cycle or cycle > 0:
-                self._label_metrics = self._repair_labels(cycle)
+        if self._labels_step is None or self._labels_step < step:
+            if self._labels_step is not None and self._labels_step < step - 1:
+                log.warning(
+                    "label store is behind the checkpoint (step %s < %s); only "
+                    "the current chunk will be repaired",
+                    self._labels_step,
+                    step,
+                )
+            if self.improve_first_cycle or step > 0:
+                self._label_metrics = self._repair_labels(
+                    step, self._chunk_indices(outer, subcycle)
+                )
                 self._index_label_metrics(self._label_metrics)
+            self._labels_step = step
 
-        self._labels_cycle = cycle
+        # `_labels_cycle` is the training block's outer cycle; the sidecar's
+        # `cycle` is the label-progress outer cycle. They differ only when a
+        # resumed checkpoint is older than the sidecar (the store is ahead).
+        progress_outer = (
+            self._labels_step // self.subcycles_per_cycle
+            if self._labels_step is not None
+            else outer
+        )
+        progress_sub = (
+            self._labels_step % self.subcycles_per_cycle
+            if self._labels_step is not None
+            else subcycle
+        )
+        self._labels_cycle = outer
         self._labels.meta.update(
             {
-                "cycle": int(cycle),
+                "cycle": int(progress_outer),
+                "repair_step": int(self._labels_step),
+                "subcycle": int(progress_sub),
+                "subcycles_per_cycle": int(self.subcycles_per_cycle),
+                "subcycle_epochs": int(self.subcycle_epochs),
                 "init": self.init,
                 "recon_iterations": int(self.recon_iterations),
                 "backbone": self.BACKBONE,
@@ -496,8 +651,10 @@ class SILRCPOMOLitModule(POMORL):
         finally:
             self.policy.train(was_training)
 
-    def _repair_labels(self, cycle: int) -> dict:
-        """Run one full reconstruction pass with the best policy so far.
+    def _repair_labels(
+        self, step: int, indices: np.ndarray | None = None
+    ) -> dict:
+        """Run one reconstruction pass over the current chunk.
 
         As in the reference, the best-validation weights are loaded before the pass
         and deliberately left in the model afterwards; the optimizer state persists.
@@ -513,18 +670,19 @@ class SILRCPOMOLitModule(POMORL):
                 env=self.env,
                 repair_batch=self.repair_batch,
                 iterations=self.recon_iterations,
-                cycle=cycle,
+                cycle=step,
                 seed=self.label_seed,
                 w_min=self.w_min,
                 w_max=self.w_max,
                 device=self.device,
+                indices=indices,
             )
         finally:
             self.policy.train(was_training)
         log.info(
-            "repaired %d labels for cycle %d: mean %.4f, best %.4f, improved %d",
+            "repaired %d labels for step %d: mean %.4f, best %.4f, improved %d",
             metrics["labels"],
-            cycle,
+            step,
             metrics["label_mean_cost"],
             metrics["label_best_cost"],
             metrics["label_improved"],
@@ -551,6 +709,8 @@ class SILRCPOMOLitModule(POMORL):
             "best_policy_state": self._best_policy_state,
             "best_metric": self._best_metric,
             "labels_cycle": self._labels_cycle,
+            "labels_step": self._labels_step,
+            "label_schedule": self._label_schedule(),
             "label_cache_path": self.label_cache_path,
             "backbone": self.BACKBONE,
             "policy": self.policy_signature(),
@@ -560,9 +720,11 @@ class SILRCPOMOLitModule(POMORL):
         """Restore the best-so-far state; the label store is reloaded from disk.
 
         Raises:
-            ValueError: If the checkpoint was written by another backbone. The
-                policy weights would fail ``load_state_dict`` too, but this names
-                the actual problem and also covers the best-policy snapshot.
+            ValueError: If the checkpoint was written by another backbone or with a
+                different label schedule (sub-cycles, sub-cycle epochs or label
+                recipe). The policy weights would fail ``load_state_dict`` too, but
+                this names the actual problem and also covers the best-policy
+                snapshot and the chunked schedule.
         """
         state = checkpoint.get("sil_rc_state")
         if state is not None:
@@ -572,9 +734,34 @@ class SILRCPOMOLitModule(POMORL):
                     f"checkpoint was written by the {saved!r} backbone but this module "
                     f"is {self.BACKBONE!r}; resume it with the same model class"
                 )
+            saved_schedule = state.get("label_schedule")
+            if saved_schedule is not None:
+                expected = self._label_schedule()
+                mismatched = {
+                    key: (expected[key], saved_schedule.get(key))
+                    for key in expected
+                    if saved_schedule.get(key) != expected[key]
+                }
+                if mismatched:
+                    raise ValueError(
+                        "checkpoint label schedule mismatch "
+                        f"{mismatched}; resume with the same --subcycles, "
+                        "--subcycle-epochs and label settings"
+                    )
+            elif (
+                self.subcycles_per_cycle != 1
+                or self.subcycle_epochs != self.cycle_epochs
+            ):
+                raise ValueError(
+                    "checkpoint predates the chunked schedule; resume it with "
+                    "subcycles_per_cycle=1 and subcycle_epochs=cycle_epochs"
+                )
             self._best_policy_state = state.get("best_policy_state")
             self._best_metric = state.get("best_metric")
             self._labels_cycle = state.get("labels_cycle")
+            self._labels_step = state.get("labels_step", self._labels_cycle)
+        else:
+            self._labels_step = None
         self._labels = None
         self._label_metrics = None
         self._label_metrics_epoch = None
@@ -589,6 +776,11 @@ class SILRCPOMOLitModule(POMORL):
         else:
             optimizer = result
         scheduler = LambdaLR(
-            optimizer, lr_lambda=_WarmupThenDecay(self.warmup_epochs, self.lr_gamma)
+            optimizer,
+            lr_lambda=_WarmupThenDecay(
+                self.warmup_epochs,
+                self.lr_gamma,
+                self.subcycles_per_cycle,
+            ),
         )
         return [optimizer], {"scheduler": scheduler, "interval": "epoch"}

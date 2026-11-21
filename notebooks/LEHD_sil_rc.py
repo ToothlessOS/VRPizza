@@ -22,6 +22,13 @@ protocol for an explicit comparison.
 the raw reference ``model_state_dict``; the weights are architecture-compatible,
 so this is a cheap alternative to the RL warm-up.
 
+The optional chunked schedule (``--subcycles S``) splits each outer cycle into
+S chunks: repair one chunk with the best policy, train on it for
+``--subcycle-epochs`` epochs, then move to the next. ``S=1`` is the reference;
+the default per-chunk epochs keep the total repair work and training rows per
+outer cycle unchanged. Validation runs every epoch, so a chunked run validates
+S times more often; ``--val-starts``/``--val-augment`` can reduce that cost.
+
 Run it with the project's virtualenv::
 
     .venv/bin/python notebooks/LEHD_sil_rc.py --smoke
@@ -68,13 +75,14 @@ WARMUP_DATA_SIZE = 50_000
 SIL_CYCLES = 5
 SIL_EPOCHS_PER_CYCLE = 20
 SIL_INSTANCES = 1_000_000
+SUBCYCLES_PER_CYCLE = 200
 RECON_ITERATIONS = 100
 REPAIR_BATCH = 256
 
 #: Effective SIL batch is 1,024, as in the reference; the heavy decoder makes a
 #: 1,024-row micro-batch infeasible, so the split is a memory knob only.
-SIL_MICRO_BATCH = 128
-SIL_ACCUM = 8
+SIL_MICRO_BATCH = 256
+SIL_ACCUM = 4
 PARTIALS_PER_INSTANCE = 1
 
 LR = 1e-4
@@ -129,6 +137,20 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=f"instances in the fixed label set (default {SIL_INSTANCES:,})",
+    )
+    parser.add_argument(
+        "--subcycles",
+        type=int,
+        default=None,
+        help=f"chunks per outer SIL cycle (default {SUBCYCLES_PER_CYCLE}); "
+        "repair one chunk, train on it, then move to the next",
+    )
+    parser.add_argument(
+        "--subcycle-epochs",
+        type=int,
+        default=None,
+        help=f"Lightning epochs per chunk (default {SIL_EPOCHS_PER_CYCLE}); use "
+        f"{SIL_EPOCHS_PER_CYCLE} // --subcycles to keep the old total epoch count",
     )
     parser.add_argument(
         "--recon-iterations",
@@ -270,6 +292,19 @@ def main() -> None:
         improve_first_cycle = init == "greedy"
 
     labels = args.labels if args.labels is not None else SIL_INSTANCES
+    subcycles = args.subcycles if args.subcycles is not None else SUBCYCLES_PER_CYCLE
+    subcycle_epochs = (
+        args.subcycle_epochs
+        if args.subcycle_epochs is not None
+        else SIL_EPOCHS_PER_CYCLE
+    )
+    if subcycles <= 0:
+        raise ValueError("--subcycles must be positive")
+    if subcycles > labels:
+        raise ValueError(f"--subcycles {subcycles} exceeds --labels {labels}")
+    if subcycle_epochs <= 0:
+        raise ValueError("--subcycle-epochs must be positive")
+    chunk_size = (labels + subcycles - 1) // subcycles
     recon_iterations = (
         args.recon_iterations if args.recon_iterations is not None else RECON_ITERATIONS
     )
@@ -287,7 +322,7 @@ def main() -> None:
         not args.no_gradient_checkpointing and GRADIENT_CHECKPOINTING
     )
 
-    sil_epochs = SIL_CYCLES * SIL_EPOCHS_PER_CYCLE
+    sil_epochs = SIL_CYCLES * subcycles * subcycle_epochs
     max_epochs = warmup_epochs + sil_epochs
     if args.max_epochs is not None:
         max_epochs = args.max_epochs
@@ -296,6 +331,10 @@ def main() -> None:
         f"lehd_sil_rc-strict-vrp{NUM_LOC}-n{labels}-c{SIL_CYCLES}x{SIL_EPOCHS_PER_CYCLE}"
         f"-r{recon_iterations}-{init}-seed{SEED}"
     )
+    if subcycles > 1:
+        run_name = f"{run_name}-s{subcycles}"
+    if subcycle_epochs != SIL_EPOCHS_PER_CYCLE:
+        run_name = f"{run_name}-e{subcycle_epochs}"
 
     # -- smoke overrides ---------------------------------------------------------
     warmup_batch = WARMUP_BATCH_SIZE
@@ -310,10 +349,13 @@ def main() -> None:
             0 if (args.from_scratch or args.policy_checkpoint is not None) else 1
         )
         labels = 6
+        subcycles = min(subcycles, labels)
+        subcycle_epochs = 1
+        chunk_size = (labels + subcycles - 1) // subcycles
         recon_iterations = 1
         repair_batch = 2
         cycle_epochs = 1
-        max_epochs = 2
+        max_epochs = warmup_epochs + subcycles * cycle_epochs
         warmup_batch = 4
         warmup_data = 8
         sil_micro = 2
@@ -370,6 +412,8 @@ def main() -> None:
         warmup_data_size=warmup_data,
         cycle_epochs=cycle_epochs,
         labels_per_cycle=labels,
+        subcycles_per_cycle=subcycles,
+        subcycle_epochs=subcycle_epochs,
         fresh_labels_per_cycle=False,
         init=init,
         improve_first_cycle=improve_first_cycle,
@@ -406,8 +450,9 @@ def main() -> None:
     )
     print(
         f"SIL:     {max_epochs - warmup_epochs} epochs, {SIL_CYCLES} x "
-        f"{cycle_epochs}-epoch cycles, {labels:,} fixed CVRP{NUM_LOC} labels, "
-        f"{recon_iterations} RRC rounds/cycle"
+        f"{subcycles} sub-cycles x {subcycle_epochs}-epoch chunks, "
+        f"{labels:,} fixed CVRP{NUM_LOC} labels ({chunk_size:,}/chunk), "
+        f"{recon_iterations} RRC rounds/outer"
     )
     print(
         f"         {sil_micro} partials x {sil_accum} accumulation = "
@@ -459,7 +504,7 @@ def main() -> None:
 
     print(
         f"best {model.generation_selection_metric}: {model._best_metric}; "
-        f"labels cycle: {model._labels_cycle}"
+        f"labels cycle: {model._labels_cycle}, step: {model._labels_step}"
     )
 
 
