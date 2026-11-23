@@ -371,7 +371,16 @@ class LEHDDecoder(ConstructiveDecoder):
         )
         customer_logits = direct.masked_fill(~unselected, neg_inf)
         logits = torch.cat([depot_logit[:, None], customer_logits], dim=-1)
-        return logits, td["action_mask"]
+        action_mask = td["action_mask"]
+        done = ~unselected.any(dim=-1)
+        if done.any():
+            # A finished row can have every action masked by the env, but the
+            # POMO inference still samples one token for it. The depot is the
+            # structural no-op and already has a finite logit; keep it legal so
+            # the masked softmax is not all -inf.
+            action_mask = action_mask.clone()
+            action_mask[:, 0] = action_mask[:, 0] | done
+        return logits, action_mask
 
     # -- faithful reference distribution ----------------------------------------
 

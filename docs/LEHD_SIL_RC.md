@@ -233,6 +233,11 @@ mean S times more validation per outer cycle; reduce `--val-starts` /
     per-chunk epochs the total repairs and rows are unchanged, but each chunk's
     teacher is the best snapshot just before it and validation runs S times more
     often. This is a target-refresh experiment, not on-policy RL.
+13. **Done-row / empty-unselected windows.** A partial window that reaches the
+    route end leaves no unselected customer, so the joint 2N normaliser is
+    `-inf`. The decoder keeps the depot action legal for those rows and the
+    exact CE does not score the structural trailing token. Without this, the
+    first SIL epoch's validation sampling and exact CE can become `nan`.
 
 ## Running it
 

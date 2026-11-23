@@ -382,6 +382,22 @@ def verify_policy_api() -> None:
         f"actions {out['actions'][0, :3].tolist()}",
     )
 
+    mixed_sample = synthetic_td(env, count=3, seed=1)
+    mixed_sample["visited"][0, 1:] = 1
+    mixed_sample["done"][0] = 1
+    mixed_sample["action_mask"] = env.get_action_mask(mixed_sample)
+    mixed_sample["action_mask"][0, 0] = False  # a fully masked done row
+    with torch.no_grad():
+        sampled = policy(
+            mixed_sample, env, phase="test", decode_type="sampling", num_starts=1
+        )
+    check(
+        "a done row is finite under sampling",
+        torch.isfinite(sampled["reward"]).all()
+        and torch.equal(sampled["actions"][0, 0], torch.tensor(0)),
+        f"actions {sampled['actions'][0, :3].tolist()}",
+    )
+
     costs, nodes, flags = policy.reference_rollout(synthetic_td(env, count=3, seed=1))
     check(
         "the reference greedy rollout covers every customer",
@@ -426,6 +442,31 @@ def verify_policy_api() -> None:
     )
     out = module._sil_step(batch)
     our_ce = float(out["ce_loss"].detach())
+
+    done_dataset = SILPartialDataset(
+        store,
+        partials_per_instance=1,
+        effective_batch_size=1,
+        w_min=10,
+        w_max=10,
+        seed=2,
+    )
+    done_batch = next(
+        iter(
+            DataLoader(
+                done_dataset,
+                batch_size=1,
+                shuffle=False,
+                collate_fn=done_dataset.collate_fn,
+            )
+        )
+    )
+    done_out = module._sil_step(done_batch)
+    check(
+        "a full-route window gives a finite exact CE",
+        torch.isfinite(done_out["loss"]).all(),
+        f"loss {float(done_out['loss'].detach()):.4f}",
+    )
 
     width = int(batch["num_loc"][0])
     capacity = float(batch["capacity"][0])

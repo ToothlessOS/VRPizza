@@ -86,7 +86,10 @@ def _calculate_exact_ce(
         log_z = capture["logz"]
 
         action = actions[:, step]
-        active = valid[:, step] & ~skip
+        # A row whose pre-action state has no unselected customer (the window
+        # reached the route end) has log_z = -inf. Its remaining tokens are
+        # structural; scoring them would turn the per-row CE into +/-inf.
+        active = valid[:, step] & ~skip & unselected.any(dim=-1)
         action_index = (action.clamp_min(1) - 1).clamp(0, n_customers - 1)
 
         if step + 1 < width:
