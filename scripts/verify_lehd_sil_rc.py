@@ -518,6 +518,44 @@ def verify_policy_api() -> None:
         f"ours {our_ce:.6f}, reference {reference_ce:.6f}",
     )
 
+    # The exact CE must not depend on the policy's own N+1 likelihood. Scaling
+    # the score head far beyond the reference's makes some teacher-forced step
+    # log-probability fall below rl4co's -1000 guard (the assertion that aborted
+    # the strict run), even though every 2N capture is finite.
+    head = module.policy.decoder.Linear_final
+    with torch.no_grad():
+        head.weight.mul_(1000.0)
+        head.bias.mul_(1000.0)
+    try:
+        coarse_rejected = False
+        try:
+            with torch.no_grad():
+                module.policy(
+                    small_env.reset_partial(batch),
+                    small_env,
+                    phase="train",
+                    actions=batch["actions"],
+                    return_sum_log_likelihood=False,
+                )
+        except AssertionError:
+            coarse_rejected = True
+        scaled_out = module._sil_step(batch)
+        scaled_finite = bool(torch.isfinite(scaled_out["loss"]).all())
+        scaled_loss = float(scaled_out["loss"].detach())
+    finally:
+        with torch.no_grad():
+            head.weight.div_(1000.0)
+            head.bias.div_(1000.0)
+    check(
+        "the scaled score head trips rl4co's N+1 teacher guard",
+        coarse_rejected,
+    )
+    check(
+        "the exact CE stays finite below the N+1 guard",
+        scaled_finite,
+        f"loss {scaled_loss:.1f}",
+    )
+
 
 def verify_rrc() -> None:
     """RRC from random-insertion labels is monotone and feasible with the LEHD policy."""

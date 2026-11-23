@@ -142,10 +142,15 @@ def _calculate_exact_ce(
 def lehd_exact_ce_step(module, batch) -> dict:
     """One reference-style teacher-forced step for the LEHD backbone.
 
-    Runs the policy in ``evaluate`` mode (so the target actions drive the
-    environment), captures the decoder's raw 2N logits at every step, and scores
-    the reference action sequence. The policy's own N+1 log-likelihood is not
-    used.
+    Drives the decoder and the environment directly over the batch's action
+    window, captures the decoder's raw 2N logits at every step, and scores the
+    reference action sequence.
+
+    ``ConstructivePolicy.forward`` is deliberately not used. It also computes the
+    policy's N+1 log-likelihood, which this objective throws away, and rl4co
+    asserts that every teacher-forced log-probability is above ``-1000``. A
+    CVRP20 warm-up applied to CVRP100 windows can legitimately produce smaller
+    values; the 2N captures -- and therefore the exact CE -- stay finite.
 
     Args:
         module: A :class:`SILRCLEHDLitModule` with ``env`` and ``policy``.
@@ -157,25 +162,30 @@ def lehd_exact_ce_step(module, batch) -> dict:
     """
     actions = batch["actions"]
     valid = batch["valid"]
-    td = module.env.reset_partial(batch)
+    if valid.shape[1] != actions.shape[1]:
+        raise ValueError("actions and valid do not share the step axis")
 
-    decoder = module.policy.decoder
+    policy = module.policy
+    decoder = policy.decoder
+    td = module.env.reset_partial(batch)
+    hidden, _ = policy.encoder(td)
+
     decoder.set_capture(True)
     try:
-        out = module.policy(
-            td,
-            module.env,
-            phase="train",
-            actions=actions,
-            return_sum_log_likelihood=False,
-        )
+        # The hook opens the capture list (`set_capture` alone does not) and
+        # returns the encoder output aligned with the batchified td. Teacher
+        # forcing never uses multistart.
+        td, env, hidden = decoder.pre_decoder_hook(td, module.env, hidden, 0)
+        for step in range(actions.shape[1]):
+            decoder(td, hidden, 0)
+            td = env.step(td.set("action", actions[:, step]))["next"]
+            if td["done"].all():
+                break
         captures = decoder.pop_captures()
     finally:
         decoder.set_capture(False)
 
-    if valid.shape[1] != actions.shape[1]:
-        raise ValueError("actions and valid do not share the step axis")
-    return _calculate_exact_ce(module, batch, out, captures)
+    return _calculate_exact_ce(module, batch, {}, captures)
 
 
 class SILRCLEHDLitModule(SILRCPOMOLitModule):

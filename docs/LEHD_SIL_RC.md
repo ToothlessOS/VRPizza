@@ -238,6 +238,15 @@ mean S times more validation per outer cycle; reduce `--val-starts` /
     `-inf`. The decoder keeps the depot action legal for those rows and the
     exact CE does not score the structural trailing token. Without this, the
     first SIL epoch's validation sampling and exact CE can become `nan`.
+14. **No N+1 likelihood in the exact CE.** `lehd_exact_ce_step` drives the
+    decoder and environment directly instead of calling
+    `ConstructivePolicy.forward`. That loop also computes the policy's N+1
+    log-likelihood, which the exact 2N CE never reads, and rl4co asserts that
+    every teacher-forced log-probability is above `-1000`. A CVRP20 warm-up
+    applied to CVRP100 windows can produce smaller values even though every 2N
+    capture is finite, so the assertion aborted the first SIL batch for an
+    unused quantity. The coarse fallback (`--no-exact-ce`) does use the N+1 CE
+    and can still hit that assertion.
 
 ## Running it
 
@@ -296,7 +305,9 @@ arm, so the gap is directly comparable to the paper's supervised number.
 4. the rl4co policy contract: greedy, multistart row order, teacher-forced
    `evaluate`, captured token distribution, the done-row depot fallback, and the
    faithful `reference_rollout`;
-5. the exact CE against the reference model's per-step loss (~1e-7);
+5. the exact CE against the reference model's per-step loss (~1e-7), and that
+   it stays finite when a scaled score head pushes the N+1 teacher
+   log-probability below rl4co's `-1000` guard;
 6. RRC monotonicity and coverage with the LEHD policy;
 7. the sidecar/checkpoint backbone and chunk-schedule guards, a tiny two-phase
    fit, and a tiny S=2 chunked exact-CE fit;
